@@ -1,5 +1,4 @@
 from fastapi import APIRouter, HTTPException, Depends
-import os
 
 from app.models.evaluation_models import HumanReview
 from app.models.query_models import (
@@ -198,13 +197,8 @@ def ask_question(
 
         seen_pages.add(page_number)
 
-        backend_url = os.getenv(
-            "PUBLIC_BACKEND_URL",
-            "http://localhost:8000"
-        ).rstrip("/")
-        
         image_path = (
-            f"{backend_url}/api/page-images/"
+            f"/api/page-images/"
             f"{active_doc_id}/page_{page_number}.png"
         )
 

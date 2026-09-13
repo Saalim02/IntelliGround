@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 
 import jwt
 from pwdlib import PasswordHash
+from sqlalchemy import inspect
 from sqlalchemy.orm import Session
 
 from app.models.auth_models import PasswordResetToken, User
@@ -45,6 +46,11 @@ def validate_password(password: str) -> None:
 def hash_password(password: str) -> str:
     validate_password(password)
     return password_hash.hash(password)
+
+
+def normalize_name(name: str | None) -> str | None:
+    normalized = str(name or "").strip()
+    return normalized or None
 
 
 def verify_password(
@@ -127,6 +133,8 @@ def create_user(
     db: Session,
     email: str,
     password: str,
+    first_name: str | None = None,
+    last_name: str | None = None,
 ) -> User:
     normalized_email = normalize_email(email)
 
@@ -148,6 +156,8 @@ def create_user(
 
     user = User(
         email=normalized_email,
+        first_name=normalize_name(first_name),
+        last_name=normalize_name(last_name),
         password_hash=hash_password(password),
         auth_provider="local",
         is_active=True,
@@ -336,5 +346,39 @@ def get_or_create_google_user(
     db.add(user)
     db.commit()
     db.refresh(user)
+
+    return user
+
+
+def update_google_user_profile(
+    db: Session,
+    user: User,
+    *,
+    first_name: str | None,
+    last_name: str | None,
+    full_name: str | None = None,
+) -> User:
+    """Fill only missing names from verified Google identity claims."""
+    given_name = normalize_name(first_name)
+    family_name = normalize_name(last_name)
+    verified_full_name = normalize_name(full_name)
+
+    if not given_name and verified_full_name:
+        parts = verified_full_name.split()
+        given_name = parts[0]
+        if not family_name and len(parts) > 1:
+            family_name = " ".join(parts[1:])
+
+    changed = False
+    if not user.first_name and given_name:
+        user.first_name = given_name
+        changed = True
+    if not user.last_name and family_name:
+        user.last_name = family_name
+        changed = True
+
+    if changed and inspect(user).persistent:
+        db.commit()
+        db.refresh(user)
 
     return user

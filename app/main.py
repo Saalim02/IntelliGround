@@ -122,11 +122,19 @@ async def rate_limit_middleware(request: Request, call_next):
 # -----------------------------------
 # CORS
 # -----------------------------------
+allowed_frontend_origins = [FRONTEND_URL]
+if FRONTEND_URL.startswith("http://localhost:"):
+    allowed_frontend_origins.append(
+        FRONTEND_URL.replace("http://localhost:", "http://127.0.0.1:", 1)
+    )
+elif FRONTEND_URL.startswith("http://127.0.0.1:"):
+    allowed_frontend_origins.append(
+        FRONTEND_URL.replace("http://127.0.0.1:", "http://localhost:", 1)
+    )
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        FRONTEND_URL,
-    ],
+    allow_origins=allowed_frontend_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

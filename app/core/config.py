@@ -49,7 +49,16 @@ EVALUATION_MODEL = os.getenv(
 
 FRONTEND_URL = os.getenv(
     "FRONTEND_URL",
-    "http://localhost:5173",
+    "http://localhost:8501",
+).strip()
+
+# -----------------------------------
+# DEVELOPER ACCESS CONFIGURATION
+# -----------------------------------
+
+DEVELOPER_ACCESS_PASSWORD = os.getenv(
+    "DEVELOPER_ACCESS_PASSWORD",
+    "",
 ).strip()
 
 # -----------------------------------

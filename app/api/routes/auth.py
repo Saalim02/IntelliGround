@@ -1,16 +1,21 @@
+import os
+import secrets
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from sqlalchemy.orm import Session
 from fastapi.responses import RedirectResponse
-from app.core.config import FRONTEND_URL
+from app.core.config import (
+    DEVELOPER_ACCESS_PASSWORD,
+    FRONTEND_URL,
+)
 
 from app.core.database import get_db
 from app.models.auth_models import User
 from app.models.auth_schemas import (
+    DeveloperAccessRequest,
     ForgotPasswordRequest,
     LoginRequest,
     RegisterRequest,
     ResetPasswordRequest,
-    TokenResponse,
     UserResponse,
 )
 from app.services.security.audit_logger import log_security_event
@@ -32,6 +37,7 @@ from app.services.security.auth_service import (
     get_or_create_google_user,
     hash_password,
     validate_password,
+    update_google_user_profile,
 )
 from app.services.security.google_oauth import (
     GOOGLE_AUTH_COOKIE_MAX_AGE_SECONDS,
@@ -51,6 +57,52 @@ router = APIRouter(
     prefix="/auth",
     tags=["Authentication"],
 )
+
+AUTH_COOKIE_NAME = "access_token"
+AUTH_COOKIE_MAX_AGE_SECONDS = 60 * 60 * 24
+SESSION_HINT_COOKIE_NAME = "intelliground_session"
+COOKIE_SECURE = os.getenv("COOKIE_SECURE", "false").strip().lower() in {"1", "true", "yes"}
+
+
+def to_user_response(user: User) -> UserResponse:
+    first_name = (user.first_name or "").strip() or None
+    last_name = (user.last_name or "").strip() or None
+    display_name = " ".join(
+        name for name in (first_name, last_name) if name
+    ) or None
+    return UserResponse(
+        id=user.id,
+        email=user.email,
+        auth_provider=user.auth_provider,
+        is_active=user.is_active,
+        first_name=first_name,
+        last_name=last_name,
+        display_name=display_name,
+    )
+
+
+def set_browser_session(response: Response, access_token: str) -> None:
+    """Set the browser session without exposing the JWT to frontend code."""
+    response.set_cookie(
+        key=AUTH_COOKIE_NAME,
+        value=access_token,
+        max_age=AUTH_COOKIE_MAX_AGE_SECONDS,
+        httponly=True,
+        secure=COOKIE_SECURE,
+        samesite="lax",
+        path="/",
+    )
+    # This contains no credential; it only lets the SPA decide whether it
+    # should restore a session on refresh without probing /auth/me on landing.
+    response.set_cookie(
+        key=SESSION_HINT_COOKIE_NAME,
+        value="1",
+        max_age=AUTH_COOKIE_MAX_AGE_SECONDS,
+        httponly=False,
+        secure=COOKIE_SECURE,
+        samesite="lax",
+        path="/",
+    )
 
 
 @router.post(
@@ -79,6 +131,8 @@ def register(
             db=db,
             email=str(payload.email),
             password=payload.password,
+            first_name=payload.first_name,
+            last_name=payload.last_name,
         )
     except ValueError as exc:
         log_security_event(
@@ -101,17 +155,12 @@ def register(
         decision="ALLOW",
     )
 
-    return UserResponse(
-        id=user.id,
-        email=user.email,
-        auth_provider=user.auth_provider,
-        is_active=user.is_active,
-    )
+    return to_user_response(user)
 
 
 @router.post(
     "/login",
-    response_model=TokenResponse,
+    response_model=UserResponse,
 )
 def login(
     request: Request,
@@ -162,11 +211,59 @@ def login(
         decision="ALLOW",
     )
 
-    return TokenResponse(
-        access_token=access_token,
-        token_type="bearer",
+    response = Response(
+        content=to_user_response(user).model_dump_json(),
+        media_type="application/json",
+    )
+    set_browser_session(response, access_token)
+    return response
+
+
+@router.post("/logout")
+def logout(response: Response):
+    response.delete_cookie(key=AUTH_COOKIE_NAME, path="/")
+    response.delete_cookie(key=SESSION_HINT_COOKIE_NAME, path="/")
+    return {"message": "Signed out successfully."}
+
+@router.post("/developer-access")
+def developer_access(
+    payload: DeveloperAccessRequest,
+    user: User = Depends(get_current_user),
+):
+    if not DEVELOPER_ACCESS_PASSWORD:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Developer access is not configured.",
+        )
+
+    if not secrets.compare_digest(
+        payload.password,
+        DEVELOPER_ACCESS_PASSWORD,
+    ):
+        log_security_event(
+            "developer_access_failed",
+            endpoint="/api/auth/developer-access",
+            client_id=str(user.id),
+            decision="BLOCK",
+            reasons=["Invalid developer access password."],
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Developer access denied.",
+        )
+
+    log_security_event(
+        "developer_access_granted",
+        endpoint="/api/auth/developer-access",
+        client_id=str(user.id),
+        decision="ALLOW",
     )
 
+    return {
+        "authorized": True,
+        "message": "Developer access granted.",
+    }
 
 
 @router.post(
@@ -362,9 +459,9 @@ def google_login(
         value=state,
         max_age=GOOGLE_STATE_MAX_AGE_SECONDS,
         httponly=True,
-        secure=False,
+        secure=COOKIE_SECURE,
         samesite="lax",
-        path="/api/auth/google",
+        path="/api/auth/google/callback",
     )
 
     log_security_event(
@@ -461,6 +558,13 @@ async def google_callback(
             email=claims["email"],
             google_sub=claims["sub"],
         )
+        user = update_google_user_profile(
+            db=db,
+            user=user,
+            first_name=claims.get("given_name"),
+            last_name=claims.get("family_name"),
+            full_name=claims.get("name"),
+        )
 
         access_token = create_access_token(
         user.id,
@@ -491,14 +595,23 @@ async def google_callback(
         value=access_token,
         max_age=GOOGLE_AUTH_COOKIE_MAX_AGE_SECONDS,
         httponly=True,
-        secure=False,
+        secure=COOKIE_SECURE,
+        samesite="lax",
+        path="/",
+    )
+    response.set_cookie(
+        key=SESSION_HINT_COOKIE_NAME,
+        value="1",
+        max_age=GOOGLE_AUTH_COOKIE_MAX_AGE_SECONDS,
+        httponly=False,
+        secure=COOKIE_SECURE,
         samesite="lax",
         path="/",
     )
 
     response.delete_cookie(
         key=GOOGLE_STATE_COOKIE_NAME,
-        path="/api/auth/google",
+        path="/api/auth/google/callback",
     )
 
     log_security_event(
@@ -517,9 +630,4 @@ async def google_callback(
 def get_me(
     current_user: User = Depends(get_current_user),
 ):
-    return UserResponse(
-        id=current_user.id,
-        email=current_user.email,
-        auth_provider=current_user.auth_provider,
-        is_active=current_user.is_active,
-    )
+    return to_user_response(current_user)

@@ -16,6 +16,7 @@ from app.services.security.auth_service import (
     create_password_reset_token,
     create_user,
 )
+from app.services.security.google_oauth import verify_oauth_state
 
 
 client = TestClient(app)
@@ -414,6 +415,88 @@ def test_password_reset_revokes_existing_access_token():
     )
 
 
+def test_developer_access_grants_with_correct_password(monkeypatch):
+    user_id = get_or_create_local_user(
+        email="developer_access_granted@example.com",
+        password="DeveloperPassword123!",
+    )
+
+    access_token = create_access_token(
+        user_id,
+        token_version=0,
+    )
+
+    monkeypatch.setattr(
+        "app.api.routes.auth.DEVELOPER_ACCESS_PASSWORD",
+        "20042002",
+    )
+
+    response = client.post(
+        "/api/auth/developer-access",
+        headers={
+            "Authorization": f"Bearer {access_token}",
+        },
+        json={
+            "password": "20042002",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "authorized": True,
+        "message": "Developer access granted.",
+    }
+
+
+def test_developer_access_rejects_wrong_password(monkeypatch):
+    user_id = get_or_create_local_user(
+        email="developer_access_denied@example.com",
+        password="DeveloperPassword123!",
+    )
+
+    access_token = create_access_token(
+        user_id,
+        token_version=0,
+    )
+
+    monkeypatch.setattr(
+        "app.api.routes.auth.DEVELOPER_ACCESS_PASSWORD",
+        "20042002",
+    )
+
+    response = client.post(
+        "/api/auth/developer-access",
+        headers={
+            "Authorization": f"Bearer {access_token}",
+        },
+        json={
+            "password": "wrong-password",
+        },
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == (
+        "Developer access denied."
+    )
+
+
+def test_developer_access_requires_authentication(monkeypatch):
+    monkeypatch.setattr(
+        "app.api.routes.auth.DEVELOPER_ACCESS_PASSWORD",
+        "20042002",
+    )
+
+    response = client.post(
+        "/api/auth/developer-access",
+        json={
+            "password": "20042002",
+        },
+    )
+
+    assert response.status_code == 401
+
+
+
 def test_weak_password_does_not_consume_reset_token():
     email = "weak_password_reset_test@example.com"
 
@@ -492,6 +575,8 @@ def test_register_uses_register_rate_limiter(monkeypatch):
     response = client.post(
         "/api/auth/register",
         json={
+            "first_name": "Rate",
+            "last_name": "Test",
             "email": email,
             "password": "RegisterPassword123!",
         },
@@ -500,6 +585,72 @@ def test_register_uses_register_rate_limiter(monkeypatch):
     assert response.status_code == 201
     assert calls
     assert calls[0] is REGISTER_RATE_LIMITER
+
+
+def test_registration_requires_first_and_last_name():
+    response = client.post(
+        "/api/auth/register",
+        json={
+            "email": f"missing-name-{uuid.uuid4().hex}@example.com",
+            "password": "RegisterPassword123!",
+        },
+    )
+
+    assert response.status_code == 422
+
+
+def test_registration_persists_names_and_me_returns_profile():
+    email = f"profile-{uuid.uuid4().hex}@example.com"
+    response = client.post(
+        "/api/auth/register",
+        json={
+            "first_name": "  Profile ",
+            "last_name": " User ",
+            "email": email,
+            "password": "RegisterPassword123!",
+        },
+    )
+
+    assert response.status_code == 201
+    assert response.json()["first_name"] == "Profile"
+    assert response.json()["last_name"] == "User"
+    assert response.json()["display_name"] == "Profile User"
+
+    login_response = client.post(
+        "/api/auth/login",
+        json={
+            "email": email,
+            "password": "RegisterPassword123!",
+        },
+    )
+    assert login_response.status_code == 200
+    assert login_response.json()["first_name"] == "Profile"
+
+    me_response = client.get("/api/auth/me")
+    assert me_response.status_code == 200
+    assert me_response.json()["display_name"] == "Profile User"
+
+
+def test_google_profile_handles_missing_family_name():
+    from app.services.security.auth_service import update_google_user_profile
+
+    user = User(
+        email="single-name@example.com",
+        auth_provider="google",
+        google_sub="single-name-sub",
+        is_active=True,
+        token_version=0,
+    )
+
+    update_google_user_profile(
+        db=None,
+        user=user,
+        first_name="Single",
+        last_name=None,
+    )
+
+    assert user.first_name == "Single"
+    assert user.last_name is None
 
 
 def test_google_login_uses_google_rate_limiter(monkeypatch):
@@ -526,6 +677,106 @@ def test_google_login_uses_google_rate_limiter(monkeypatch):
     assert response.status_code == 307
     assert calls
     assert calls[0] is GOOGLE_LOGIN_RATE_LIMITER
+
+
+def test_oauth_state_requires_a_present_matching_value():
+    assert verify_oauth_state("state-value", "state-value") is True
+    assert verify_oauth_state("", "state-value") is False
+    assert verify_oauth_state("state-value", "") is False
+    assert verify_oauth_state("different-state", "state-value") is False
+
+
+def test_google_state_cookie_is_scoped_to_callback(monkeypatch):
+    monkeypatch.setattr(
+        "app.api.routes.auth.build_google_authorization_url",
+        lambda state: "https://accounts.google.com/test",
+    )
+
+    response = client.get(
+        "/api/auth/google/login",
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 307
+    set_cookie = response.headers["set-cookie"]
+    assert "Path=/api/auth/google/callback" in set_cookie
+    assert "Path=/api/auth/google;" not in set_cookie
+
+
+def test_missing_or_mismatched_oauth_state_is_rejected():
+    client.cookies.clear()
+
+    missing = client.get(
+        "/api/auth/google/callback?code=test-code",
+        follow_redirects=False,
+    )
+    mismatched = client.get(
+        "/api/auth/google/callback?state=received&code=test-code",
+        follow_redirects=False,
+    )
+
+    assert missing.status_code == 400
+    assert mismatched.status_code == 400
+    assert missing.json()["detail"] == "Invalid OAuth state."
+    assert mismatched.json()["detail"] == "Invalid OAuth state."
+
+
+def test_successful_google_callback_consumes_state_cookie(monkeypatch):
+    from app.api.routes import auth as auth_routes
+
+    client.cookies.clear()
+    test_user = User(
+        id=999998,
+        email="oauth_single_use@example.com",
+        auth_provider="google",
+        google_sub="oauth-single-use-sub",
+        is_active=True,
+        token_version=0,
+    )
+
+    monkeypatch.setattr(
+        "app.api.routes.auth.build_google_authorization_url",
+        lambda state: "https://accounts.google.com/test",
+    )
+    login_response = client.get(
+        "/api/auth/google/login",
+        follow_redirects=False,
+    )
+    state = login_response.cookies.get("google_oauth_state")
+    assert state
+
+    monkeypatch.setattr(
+        auth_routes,
+        "get_google_config",
+        lambda: {
+            "client_id": "test-client-id",
+            "client_secret": "test-client-secret",
+            "redirect_uri": "http://localhost:8000/api/auth/google/callback",
+        },
+    )
+
+    async def fake_exchange_code_for_tokens(code):
+        return {"id_token": "test-id-token"}
+
+    async def fake_verify_google_id_token(id_token, client_id):
+        return {
+            "email": test_user.email,
+            "sub": test_user.google_sub,
+            "email_verified": True,
+        }
+
+    monkeypatch.setattr(auth_routes, "exchange_code_for_tokens", fake_exchange_code_for_tokens)
+    monkeypatch.setattr(auth_routes, "verify_google_id_token", fake_verify_google_id_token)
+    monkeypatch.setattr(auth_routes, "get_or_create_google_user", lambda db, email, google_sub: test_user)
+
+    callback_url = f"/api/auth/google/callback?state={state}&code=test-code"
+    first = client.get(callback_url, follow_redirects=False)
+    replay = client.get(callback_url, follow_redirects=False)
+
+    assert first.status_code == 303
+    assert "google_oauth_state=;" in first.headers["set-cookie"]
+    assert replay.status_code == 400
+    assert replay.json()["detail"] == "Invalid OAuth state."
 
 
 def test_google_callback_redirects_to_configured_frontend(monkeypatch):
@@ -564,6 +815,8 @@ def test_google_callback_redirects_to_configured_frontend(monkeypatch):
             "email": test_user.email,
             "sub": test_user.google_sub,
             "email_verified": True,
+            "given_name": "OAuth",
+            "family_name": "Redirect",
         }
 
     monkeypatch.setattr(
@@ -596,3 +849,5 @@ def test_google_callback_redirects_to_configured_frontend(monkeypatch):
 
     assert response.status_code == 303
     assert response.headers["location"] == FRONTEND_URL
+    assert test_user.first_name == "OAuth"
+    assert test_user.last_name == "Redirect"

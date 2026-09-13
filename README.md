@@ -176,18 +176,26 @@ Then adapts answer style accordingly.
 
 ---
 
-### 🎯 Clean UI (Streamlit)
+### 🎯 Modern React UI
+
+The application uses a React + TypeScript frontend served through Nginx.
 
 Users can:
-- Upload PDF
-- View summary + key topics
+- Sign up and sign in
+- Configure RAG access
+- Upload documents
+- Monitor document processing
+- View document summaries
 - Explore suggested questions
 - Ask document-based questions
-- See:
-  - Answer
-  - Confidence
-  - Evidence
-  - Page preview images
+- Inspect answers and supporting evidence
+- Review source/page information
+- Access Security Lab
+- Inspect LLM Evaluation
+- Perform Human Review
+- Use Developer Experience features
+
+The frontend communicates with the FastAPI backend through authenticated HTTP APIs.
 
 ---
 
@@ -203,7 +211,10 @@ Users can:
 - OpenAI (user-provided API key)
 
 ### Frontend
-- Streamlit
+- React
+- TypeScript
+- Vite
+- Nginx
 
 ### Storage
 - Local file system
@@ -221,12 +232,17 @@ project root/
 │   ├── models/
 │   ├── utils/
 │   └── main.py
-├── uploads/
-├── vectorstore/
-├── debug_output/
-├── page_images/
-├── screenshots/
-├── streamlit_app.py
+├── frontend/
+│   └── react-app/
+│       ├── src/
+│       ├── e2e/
+│       ├── package.json
+│       └── nginx.conf
+├── storage/
+├── logs/
+├── Dockerfile.backend
+├── Dockerfile.frontend
+├── docker-compose.yml
 ├── requirements.txt
 └── README.md
 ```

@@ -31,3 +31,12 @@ logs/
 # OS Files
 .DS_Store
 Thumbs.db
+# Local Python virtual environment
+.venv/
+
+# Local React dependencies/build output
+frontend/react-app/node_modules/
+frontend/react-app/dist/
+
+# Local source/archive artifacts
+*.tar.gz
