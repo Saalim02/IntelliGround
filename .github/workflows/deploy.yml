@@ -38,16 +38,43 @@ jobs:
             echo "Building and starting containers..."
             docker compose up -d --build --remove-orphans
 
-            echo "Waiting for services..."
-            sleep 10
+            echo "Waiting for backend..."
 
-            echo "Checking backend..."
-            curl --fail --silent --show-error \
-              http://localhost:8000/openapi.json > /dev/null
+            for i in {1..30}; do
+              if curl --fail --silent --show-error \
+                  http://localhost:8000/health > /dev/null; then
+                echo "Backend is healthy."
+                break
+              fi
+
+              if [ "$i" -eq 30 ]; then
+                echo "Backend failed to become healthy."
+                docker compose logs --tail=100 backend
+                exit 1
+              fi
+
+              echo "Backend not ready yet. Attempt $i/30..."
+              sleep 2
+            done
 
             echo "Checking frontend..."
-            curl --fail --silent --show-error \
-              http://localhost:8501/ > /dev/null
+
+            for i in {1..30}; do
+              if curl --fail --silent --show-error \
+                  http://localhost:8501/ > /dev/null; then
+                echo "Frontend is healthy."
+                break
+              fi
+
+              if [ "$i" -eq 30 ]; then
+                echo "Frontend failed to become healthy."
+                docker compose logs --tail=100 frontend
+                exit 1
+              fi
+
+              echo "Frontend not ready yet. Attempt $i/30..."
+              sleep 2
+            done
 
             echo "Checking container status..."
             docker compose ps
