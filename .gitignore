@@ -39,3 +39,6 @@ Thumbs.db
 .venv/
 storage/users/
 logs/
+
+# SSH private keys
+*.pem
