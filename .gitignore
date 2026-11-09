@@ -42,3 +42,4 @@ logs/
 
 # SSH private keys
 *.pem
+.env

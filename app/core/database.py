@@ -47,6 +47,7 @@ def get_db():
 
 def init_db():
     from app.models.auth_models import User, PasswordResetToken
+    from app.models.conversation_models import Conversation, ConversationTurn
 
     Base.metadata.create_all(bind=engine)
 
@@ -56,6 +57,7 @@ def init_db():
         column["name"]
         for column in inspect(engine).get_columns(User.__tablename__)
     }
+    boolean_default = "FALSE" if engine.dialect.name == "postgresql" else "0"
     with engine.begin() as connection:
         for column_name in ("first_name", "last_name"):
             if column_name not in existing_columns:
@@ -64,3 +66,7 @@ def init_db():
                         f"ALTER TABLE users ADD COLUMN {column_name} VARCHAR(80)"
                     )
                 )
+        if "onboarding_completed" not in existing_columns:
+            connection.execute(text(
+                f"ALTER TABLE users ADD COLUMN onboarding_completed BOOLEAN NOT NULL DEFAULT {boolean_default}"
+            ))

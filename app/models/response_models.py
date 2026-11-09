@@ -13,7 +13,11 @@ class UploadPDFResponse(BaseModel):
     selected_chunk_size: int
     selected_chunk_overlap: int
     preview_chunk: Optional[str] = None
+    input_language: Optional[str] = None
+    evidence_language: Optional[str] = None
+    response_language: Optional[str] = None
     message: Optional[str] = None
+    job_id: Optional[str] = None
 
 
 class ErrorResponse(BaseModel):

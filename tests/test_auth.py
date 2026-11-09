@@ -774,7 +774,10 @@ def test_successful_google_callback_consumes_state_cookie(monkeypatch):
     replay = client.get(callback_url, follow_redirects=False)
 
     assert first.status_code == 303
-    assert "google_oauth_state=;" in first.headers["set-cookie"]
+    first_set_cookie = first.headers["set-cookie"]
+    assert "google_oauth_state" in first_set_cookie
+    assert 'google_oauth_state=""' in first_set_cookie
+    assert "Max-Age=0" in first_set_cookie
     assert replay.status_code == 400
     assert replay.json()["detail"] == "Invalid OAuth state."
 

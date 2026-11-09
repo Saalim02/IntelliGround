@@ -1,12 +1,20 @@
+
 from fastapi.testclient import TestClient
 
 from app.main import app
 from app.api.routes import query as query_route
-from app.models.evaluation_models import EvaluationDecision, EvaluationResult
+from app.models.evaluation_models import (
+    EvaluationDecision,
+    EvaluationResult,
+)
 
 
 client = TestClient(app)
 
+
+# ---------------------------------------------------------
+# TEST AUTHENTICATION HELPERS
+# ---------------------------------------------------------
 
 def get_test_token():
     """Create/reuse a dedicated test user without hitting auth rate limits."""
@@ -35,6 +43,7 @@ def get_test_token():
         return create_access_token(user.id)
     finally:
         db.close()
+
 
 def auth_headers():
     return {
@@ -74,6 +83,7 @@ def auth_headers_for(email: str):
         "Authorization": f"Bearer {get_test_user_token(email)}",
     }
 
+
 def allow_semantic_security(monkeypatch):
     from app.models.security_models import (
         SecurityCheckResult,
@@ -112,6 +122,10 @@ def get_test_user_id(email: str):
         db.close()
 
 
+# ---------------------------------------------------------
+# MOCK RETRIEVAL OUTPUT
+# ---------------------------------------------------------
+
 def build_mock_retrieval_output():
     return {
         "status": "success",
@@ -124,19 +138,29 @@ def build_mock_retrieval_output():
                 "chunk_id": 1,
                 "file_name": "test_document.pdf",
                 "page_number": 3,
-                "text": "The project uses hybrid retrieval combining vector search and BM25.",
+                "text": (
+                    "The project uses hybrid retrieval "
+                    "combining vector search and BM25."
+                ),
                 "score": 0.8,
             },
             {
                 "chunk_id": 2,
                 "file_name": "test_document.pdf",
                 "page_number": 4,
-                "text": "The system reranks retrieved evidence before generating the final answer.",
+                "text": (
+                    "The system reranks retrieved evidence "
+                    "before generating the final answer."
+                ),
                 "score": 1.0,
             },
         ],
     }
 
+
+# ---------------------------------------------------------
+# MOCK EVALUATION
+# ---------------------------------------------------------
 
 def build_mock_evaluation():
     return EvaluationResult(
@@ -151,13 +175,59 @@ def build_mock_evaluation():
         citation_quality=1.00,
         overall_confidence=0.94,
         decision=EvaluationDecision.AUTO_APPROVE,
-        reasons=["All evaluation dimensions are within acceptable ranges."],
+        reasons=[
+            "All evaluation dimensions are within acceptable ranges."
+        ],
         claims=[],
     )
 
 
+# ---------------------------------------------------------
+# EVALUATION SAVE MOCK
+# ---------------------------------------------------------
+
+def mock_evaluation_storage(monkeypatch):
+    """Capture saved evaluations and verify user ownership."""
+    saved_evaluations = []
+
+    def mock_save_evaluation(evaluation, user_id=None):
+        saved_evaluations.append(
+            {
+                "evaluation": evaluation,
+                "user_id": user_id,
+            }
+        )
+        return evaluation.evaluation_id
+
+    monkeypatch.setattr(
+        query_route,
+        "save_evaluation",
+        mock_save_evaluation,
+    )
+
+    return saved_evaluations
+
+
+def assert_evaluation_saved(
+    saved_evaluations,
+    evaluation,
+    expected_email="query_evaluation_test@example.com",
+):
+    assert len(saved_evaluations) == 1
+
+    saved = saved_evaluations[0]
+
+    assert saved["evaluation"] is evaluation
+    assert saved["user_id"] == get_test_user_id(expected_email)
+
+
+# ---------------------------------------------------------
+# TEST 1: AUTO APPROVE
+# ---------------------------------------------------------
+
 def test_ask_route_integrates_evaluation(monkeypatch):
     allow_semantic_security(monkeypatch)
+
     monkeypatch.setattr(
         query_route,
         "resolve_authorized_api_key",
@@ -194,17 +264,7 @@ def test_ask_route_integrates_evaluation(monkeypatch):
         ),
     )
 
-    saved_evaluations = []
-
-    def mock_save_evaluation(evaluation, user_id=None):
-        saved_evaluations.append((evaluation, user_id))
-        return evaluation.evaluation_id
-
-    monkeypatch.setattr(
-        query_route,
-        "save_evaluation",
-        mock_save_evaluation,
-    )
+    saved_evaluations = mock_evaluation_storage(monkeypatch)
 
     response = client.post(
         "/api/ask",
@@ -235,16 +295,15 @@ def test_ask_route_integrates_evaluation(monkeypatch):
     assert data["evaluation"]["overall_confidence"] == 0.94
     assert data["evaluation"]["decision"] == "AUTO_APPROVE"
 
-    assert len(saved_evaluations) == 1
-
-    saved_evaluation, saved_user_id = saved_evaluations[0]
-
-    assert saved_evaluation is mock_evaluation
-    assert saved_evaluation.evaluation_id == "eval-test-001"
-    assert saved_user_id == get_test_user_id(
-        "query_evaluation_test@example.com"
+    assert_evaluation_saved(
+        saved_evaluations,
+        mock_evaluation,
     )
 
+
+# ---------------------------------------------------------
+# TEST 2: LOW RETRIEVAL CONFIDENCE
+# ---------------------------------------------------------
 
 def test_ask_route_does_not_call_evaluation_when_retrieval_is_low(
     monkeypatch,
@@ -275,6 +334,7 @@ def test_ask_route_does_not_call_evaluation_when_retrieval_is_low(
     def fail_if_evaluation_called(*args, **kwargs):
         nonlocal evaluation_called
         evaluation_called = True
+
         raise AssertionError(
             "Evaluation should not run when retrieval confidence is low."
         )
@@ -304,6 +364,10 @@ def test_ask_route_does_not_call_evaluation_when_retrieval_is_low(
     assert data["evaluation"] is None
     assert evaluation_called is False
 
+
+# ---------------------------------------------------------
+# TEST 3: GET EVALUATION
+# ---------------------------------------------------------
 
 def test_get_evaluation_returns_persisted_evaluation(monkeypatch):
     mock_evaluation = build_mock_evaluation()
@@ -357,6 +421,10 @@ def test_get_evaluation_returns_404_when_not_found(monkeypatch):
 
     assert data["detail"] == "Evaluation not found."
 
+
+# ---------------------------------------------------------
+# TEST 4: HUMAN REVIEW SUBMISSION
+# ---------------------------------------------------------
 
 def test_submit_human_review_saves_review(monkeypatch):
     mock_evaluation = build_mock_evaluation()
@@ -452,6 +520,10 @@ def test_submit_human_review_returns_404_when_evaluation_missing(
     assert data["detail"] == "Evaluation not found."
 
 
+# ---------------------------------------------------------
+# TEST 5: AUTHENTICATION
+# ---------------------------------------------------------
+
 def test_get_evaluation_requires_authentication():
     response = client.get(
         "/api/evaluation/eval-test-001"
@@ -473,20 +545,20 @@ def test_submit_human_review_requires_authentication():
     assert response.status_code == 401
 
 
-def test_user_cannot_access_another_users_evaluation(monkeypatch):
-    """
-    Verify the storage layer is queried using the authenticated
-    user's ID, so another user's evaluation is invisible.
-    """
+# ---------------------------------------------------------
+# TEST 6: USER ISOLATION
+# ---------------------------------------------------------
 
-    mock_evaluation = build_mock_evaluation()
+def test_user_cannot_access_another_users_evaluation(monkeypatch):
+    """Verify evaluation access is scoped to the authenticated user."""
 
     owner_email = "evaluation_owner_test@example.com"
     attacker_email = "evaluation_attacker_test@example.com"
 
-    owner_token = get_test_user_token(owner_email)
+    get_test_user_token(owner_email)
     attacker_headers = auth_headers_for(attacker_email)
 
+    mock_evaluation = build_mock_evaluation()
     calls = []
 
     def mock_load_evaluation(evaluation_id, user_id=None):
@@ -497,7 +569,6 @@ def test_user_cannot_access_another_users_evaluation(monkeypatch):
             }
         )
 
-        # Evaluation belongs only to the owner.
         if evaluation_id == "eval-owned-by-user":
             owner_id = get_test_user_id(owner_email)
 
@@ -527,10 +598,7 @@ def test_user_cannot_access_another_users_evaluation(monkeypatch):
 
 
 def test_user_cannot_review_another_users_evaluation(monkeypatch):
-    """
-    Verify a user cannot submit a human review against an
-    evaluation owned by another user.
-    """
+    """Verify a user cannot review another user's evaluation."""
 
     owner_email = "review_owner_test@example.com"
     attacker_email = "review_attacker_test@example.com"
@@ -571,4 +639,142 @@ def test_user_cannot_review_another_users_evaluation(monkeypatch):
     assert calls
     assert calls[-1]["user_id"] == get_test_user_id(
         attacker_email
+    )
+
+
+# ---------------------------------------------------------
+# TEST 7: REVIEW RECOMMENDED DECISION
+# ---------------------------------------------------------
+
+def test_ask_route_marks_review_recommended(monkeypatch):
+    allow_semantic_security(monkeypatch)
+
+    monkeypatch.setattr(
+        query_route,
+        "resolve_authorized_api_key",
+        lambda user, access_password, user_openai_api_key: "test-api-key",
+    )
+
+    monkeypatch.setattr(
+        query_route,
+        "retrieve_relevant_chunks",
+        lambda question, user_id=None: build_mock_retrieval_output(),
+    )
+
+    monkeypatch.setattr(
+        query_route,
+        "get_active_document",
+        lambda user_id=None: {"active_doc_id": "test-doc-001"},
+    )
+
+    monkeypatch.setattr(
+        query_route,
+        "generate_grounded_answer",
+        lambda question, retrieved_chunks, api_key: (
+            "The system uses hybrid retrieval."
+        ),
+    )
+
+    evaluation = build_mock_evaluation()
+    evaluation.decision = EvaluationDecision.REVIEW_RECOMMENDED
+
+    monkeypatch.setattr(
+        query_route,
+        "evaluate_rag_response",
+        lambda **kwargs: evaluation,
+    )
+
+    saved_evaluations = mock_evaluation_storage(monkeypatch)
+
+    response = client.post(
+        "/api/ask",
+        headers=auth_headers(),
+        json={
+            "question": "How does the system retrieve evidence?",
+            "access_password": "test-password",
+            "user_openai_api_key": "",
+        },
+    )
+
+    assert response.status_code == 200
+
+    data = response.json()
+
+    assert data["status"] == "review_recommended"
+    assert data["answer"] == "The system uses hybrid retrieval."
+    assert data["evaluation"]["decision"] == "REVIEW_RECOMMENDED"
+    assert data["evaluation"]["evaluation_id"] == "eval-test-001"
+
+    assert_evaluation_saved(
+        saved_evaluations,
+        evaluation,
+    )
+
+
+# ---------------------------------------------------------
+# TEST 8: HUMAN REVIEW REQUIRED
+# ---------------------------------------------------------
+
+def test_ask_route_withholds_human_review_answer(monkeypatch):
+    allow_semantic_security(monkeypatch)
+
+    monkeypatch.setattr(
+        query_route,
+        "resolve_authorized_api_key",
+        lambda user, access_password, user_openai_api_key: "test-api-key",
+    )
+
+    monkeypatch.setattr(
+        query_route,
+        "retrieve_relevant_chunks",
+        lambda question, user_id=None: build_mock_retrieval_output(),
+    )
+
+    monkeypatch.setattr(
+        query_route,
+        "get_active_document",
+        lambda user_id=None: {"active_doc_id": "test-doc-001"},
+    )
+
+    monkeypatch.setattr(
+        query_route,
+        "generate_grounded_answer",
+        lambda question, retrieved_chunks, api_key: (
+            "Potentially unsupported answer."
+        ),
+    )
+
+    evaluation = build_mock_evaluation()
+    evaluation.decision = EvaluationDecision.HUMAN_REVIEW
+
+    monkeypatch.setattr(
+        query_route,
+        "evaluate_rag_response",
+        lambda **kwargs: evaluation,
+    )
+
+    saved_evaluations = mock_evaluation_storage(monkeypatch)
+
+    response = client.post(
+        "/api/ask",
+        headers=auth_headers(),
+        json={
+            "question": "How does the system retrieve evidence?",
+            "access_password": "test-password",
+            "user_openai_api_key": "",
+        },
+    )
+
+    assert response.status_code == 200
+
+    data = response.json()
+
+    assert data["status"] == "human_review_required"
+    assert data["answer"] is None
+    assert data["evaluation"]["decision"] == "HUMAN_REVIEW"
+    assert data["evaluation"]["evaluation_id"] == "eval-test-001"
+
+    assert_evaluation_saved(
+        saved_evaluations,
+        evaluation,
     )

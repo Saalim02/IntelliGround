@@ -6,6 +6,7 @@ python-multipart
 
 requests
 httpx
+websockets
 
 openai
 
@@ -19,6 +20,7 @@ faiss-cpu
 
 numpy
 tqdm
+rank-bm25
 
 pymupdf
 SQLAlchemy
@@ -26,3 +28,6 @@ PyJWT
 pwdlib[argon2]
 email-validator
 Authlib
+
+pytesseract
+Pillow

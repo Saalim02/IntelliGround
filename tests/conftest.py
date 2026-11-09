@@ -1,0 +1,100 @@
+"""Test-client compatibility helpers.
+
+Starlette's synchronous TestClient hangs in the current environment while
+waiting for its AnyIO blocking portal. Use the supported ASGI transport through
+httpx's async client instead, while keeping the synchronous test API and cookie
+behaviour used by the existing tests.
+"""
+
+import asyncio
+from http.cookies import SimpleCookie
+from typing import Any
+
+import httpx
+import fastapi.testclient
+import anyio.to_thread
+
+
+async def _run_sync_without_worker(
+    func: Any,
+    *args: Any,
+    **_: Any,
+) -> Any:
+    """Work around the unavailable AnyIO worker pool in this test runtime."""
+    return func(*args)
+
+
+anyio.to_thread.run_sync = _run_sync_without_worker
+
+
+class ASGISyncTestClient:
+    __test__ = False
+
+    def __init__(
+        self,
+        app: Any,
+        base_url: str = "http://testserver",
+        *,
+        follow_redirects: bool = True,
+        **_: Any,
+    ) -> None:
+        self.app = app
+        self.base_url = base_url
+        self.follow_redirects = follow_redirects
+        self.cookies = httpx.Cookies()
+
+    async def _request_async(
+        self,
+        method: str,
+        url: str,
+        **kwargs: Any,
+    ) -> httpx.Response:
+        transport = httpx.ASGITransport(app=self.app)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url=self.base_url,
+            cookies=self.cookies,
+            follow_redirects=kwargs.pop(
+                "follow_redirects",
+                self.follow_redirects,
+            ),
+        ) as client:
+            response = await client.request(method, url, **kwargs)
+            self.cookies.update(response.cookies)
+            for set_cookie in response.headers.get_list("set-cookie"):
+                parsed = SimpleCookie()
+                parsed.load(set_cookie)
+                for name, morsel in parsed.items():
+                    if morsel["max-age"] == "0":
+                        self.cookies.delete(name)
+            return response
+
+    def request(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
+        return asyncio.run(self._request_async(method, url, **kwargs))
+
+    def get(self, url: str, **kwargs: Any) -> httpx.Response:
+        return self.request("GET", url, **kwargs)
+
+    def post(self, url: str, **kwargs: Any) -> httpx.Response:
+        return self.request("POST", url, **kwargs)
+
+    def put(self, url: str, **kwargs: Any) -> httpx.Response:
+        return self.request("PUT", url, **kwargs)
+
+    def patch(self, url: str, **kwargs: Any) -> httpx.Response:
+        return self.request("PATCH", url, **kwargs)
+
+    def delete(self, url: str, **kwargs: Any) -> httpx.Response:
+        return self.request("DELETE", url, **kwargs)
+
+    def options(self, url: str, **kwargs: Any) -> httpx.Response:
+        return self.request("OPTIONS", url, **kwargs)
+
+    def __enter__(self) -> "ASGISyncTestClient":
+        return self
+
+    def __exit__(self, *args: Any) -> None:
+        return None
+
+
+fastapi.testclient.TestClient = ASGISyncTestClient

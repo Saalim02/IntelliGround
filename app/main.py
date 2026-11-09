@@ -1,9 +1,11 @@
 from dotenv import load_dotenv
+from app.core.logging_config import configure_application_logging
 
 # -----------------------------------
 # LOAD ENV VARIABLES
 # -----------------------------------
 load_dotenv()
+configure_application_logging()
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -39,6 +41,11 @@ from app.api.routes.suggested_questions import (
 from app.api.routes.page_images import (
     router as page_images_router
 )
+from app.api.routes.document_intelligence import (
+    router as document_intelligence_router,
+)
+from app.api.routes.voice import router as voice_router
+from app.api.routes.developer import router as developer_router
 
 from app.core.config import (
     FRONTEND_URL,
@@ -122,15 +129,22 @@ async def rate_limit_middleware(request: Request, call_next):
 # -----------------------------------
 # CORS
 # -----------------------------------
-allowed_frontend_origins = [FRONTEND_URL]
-if FRONTEND_URL.startswith("http://localhost:"):
-    allowed_frontend_origins.append(
-        FRONTEND_URL.replace("http://localhost:", "http://127.0.0.1:", 1)
-    )
-elif FRONTEND_URL.startswith("http://127.0.0.1:"):
-    allowed_frontend_origins.append(
-        FRONTEND_URL.replace("http://127.0.0.1:", "http://localhost:", 1)
-    )
+allowed_frontend_origins = [
+    FRONTEND_URL,
+    "http://localhost:8501",
+    "http://127.0.0.1:8501",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:5174",
+    "http://127.0.0.1:5174",
+    "http://localhost:5175",
+    "http://127.0.0.1:5175",
+    "http://localhost:4173",
+    "http://127.0.0.1:4173",
+]
+
+# Remove duplicate origins while preserving order
+allowed_frontend_origins = list(dict.fromkeys(allowed_frontend_origins))
 
 app.add_middleware(
     CORSMiddleware,
@@ -196,6 +210,18 @@ app.include_router(
     tags=["Page Images"]
 )
 app.include_router(
+    document_intelligence_router,
+    prefix="/api",
+)
+app.include_router(
     auth_router,
+    prefix="/api",
+)
+app.include_router(
+    voice_router,
+    prefix="/api",
+)
+app.include_router(
+    developer_router,
     prefix="/api",
 )

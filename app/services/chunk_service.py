@@ -1,3 +1,6 @@
+
+import re
+
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 
@@ -17,7 +20,6 @@ def get_page_chunk_config(text: str):
         chunk_size = 700
         chunk_overlap = 120
 
-    # Safety
     if total_chars < chunk_size:
         chunk_size = max(total_chars, 50)
 
@@ -26,23 +28,86 @@ def get_page_chunk_config(text: str):
 
     return {
         "chunk_size": chunk_size,
-        "chunk_overlap": chunk_overlap
+        "chunk_overlap": chunk_overlap,
     }
 
 
-def chunk_page_text(text: str):
-    cleaned_text = text.strip()
+def chunk_page_text_with_metadata(text: str):
+    """
+    Split one PDF page while preserving paragraph boundaries
+    where possible.
 
-    if not cleaned_text:
+    Character offsets refer to the original extracted page text.
+    """
+
+    if not text or not text.strip():
         return [], {"chunk_size": 0, "chunk_overlap": 0}
+
+    leading_whitespace = len(text) - len(text.lstrip())
+    cleaned_text = text.strip()
 
     config = get_page_chunk_config(cleaned_text)
 
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=config["chunk_size"],
-        chunk_overlap=config["chunk_overlap"]
+        chunk_overlap=config["chunk_overlap"],
+        separators=["\n\n", "\n", " ", ""],
+        add_start_index=True,
     )
 
-    chunks = splitter.split_text(cleaned_text)
+    split_documents = splitter.create_documents([cleaned_text])
+
+    # Find paragraph spans in the original extracted page text.
+    paragraph_spans = []
+
+    for paragraph_id, match in enumerate(
+        re.finditer(r"\S.*?(?=\n\s*\n|\Z)", cleaned_text, re.DOTALL),
+        start=1,
+    ):
+        paragraph_spans.append(
+            (paragraph_id, match.start(), match.end())
+        )
+
+    chunks = []
+
+    for document in split_documents:
+        chunk_text = document.page_content
+        relative_start = document.metadata.get("start_index")
+
+        if relative_start is None:
+            raise ValueError(
+                "Text splitter did not return a chunk start index."
+            )
+
+        relative_end = relative_start + len(chunk_text)
+
+        paragraph_ids = [
+            paragraph_id
+            for paragraph_id, paragraph_start, paragraph_end
+            in paragraph_spans
+            if (
+                paragraph_start < relative_end
+                and paragraph_end > relative_start
+            )
+        ]
+
+        chunks.append({
+            "text": chunk_text,
+            "start_char": leading_whitespace + relative_start,
+            "end_char": leading_whitespace + relative_end,
+            "paragraph_ids": paragraph_ids,
+        })
 
     return chunks, config
+
+
+def chunk_page_text(text: str):
+    """
+    Backward-compatible interface.
+
+    Existing callers still receive (list[str], config).
+    """
+
+    chunks, config = chunk_page_text_with_metadata(text)
+
+    return [chunk["text"] for chunk in chunks], config

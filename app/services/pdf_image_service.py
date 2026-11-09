@@ -8,6 +8,7 @@ def generate_page_images(
     pdf_path: str,
     doc_id: str,
     user_id: int | None = None,
+    progress_callback=None,
 ):
     """
     Converts PDF pages into images.
@@ -32,7 +33,8 @@ def generate_page_images(
 
     image_paths = []
 
-    for page_num in range(len(doc)):
+    total_pages = len(doc)
+    for page_num in range(total_pages):
 
         page = doc.load_page(page_num)
 
@@ -53,6 +55,8 @@ def generate_page_images(
             "page_number": page_num + 1,
             "image_path": str(image_path),
         })
+        if progress_callback is not None:
+            progress_callback(page_num + 1, total_pages)
 
     doc.close()
 

@@ -33,6 +33,7 @@ def get_test_token():
     finally:
         db.close()
 
+
 def auth_headers():
     return {
         "Authorization": f"Bearer {get_test_token()}",
@@ -42,6 +43,7 @@ def auth_headers():
 def auth_form_data():
     return {
         "access_password": "20022004",
+        "language": "auto",
     }
 
 
@@ -102,7 +104,9 @@ def test_upload_malformed_pdf_is_rejected_and_cleaned_up(
 
     monkeypatch.setattr(
         "app.api.routes.upload.extract_text_from_pdf",
-        lambda _: (_ for _ in ()).throw(
+        lambda _, language_hint="auto": (
+            _ for _ in ()
+        ).throw(
             ValueError(
                 "Invalid or unreadable PDF: cannot open malformed PDF"
             )
@@ -125,6 +129,8 @@ def test_upload_malformed_pdf_is_rejected_and_cleaned_up(
     assert response.status_code == 400
     assert "Invalid or unreadable PDF" in response.json()["detail"]
     assert not saved_path.exists()
+
+
 def test_scanned_pdf_is_returned_as_error_and_cleaned_up(
     tmp_path,
     monkeypatch,
@@ -149,7 +155,7 @@ def test_scanned_pdf_is_returned_as_error_and_cleaned_up(
 
     monkeypatch.setattr(
         "app.api.routes.upload.extract_text_from_pdf",
-        lambda _: {
+        lambda _, language_hint="auto": {
             "pages": [
                 {
                     "page_number": 1,
@@ -179,6 +185,27 @@ def test_scanned_pdf_is_returned_as_error_and_cleaned_up(
 
     assert data["status"] == "error"
     assert data["filename"] == "scanned.pdf"
-    assert "scanned" in data["message"].lower()
+    assert "insufficient readable text" in data["message"].lower()
 
     assert not (tmp_path / "scanned.pdf").exists()
+
+
+def test_upload_rejects_unsupported_ocr_language():
+    response = client.post(
+        "/api/upload-pdf",
+        headers=auth_headers(),
+        data={
+            **auth_form_data(),
+            "language": "unsupported",
+        },
+        files={
+            "file": (
+                "sample.pdf",
+                b"fake-pdf-content",
+                "application/pdf",
+            )
+        },
+    )
+
+    assert response.status_code == 400
+    assert "Unsupported OCR language" in response.json()["detail"]

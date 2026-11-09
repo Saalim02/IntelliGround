@@ -56,6 +56,10 @@ class User(Base):
         default=True,
     )
 
+    onboarding_completed: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="0"
+    )
+
     # Incremented when credentials are reset/revoked.
     # JWTs contain this value so previously issued tokens
     # can be invalidated without storing raw JWTs.

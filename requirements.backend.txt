@@ -31,3 +31,9 @@ Authlib
 cryptography
 joserfc
 httpx
+websockets
+
+pytesseract
+Pillow
+rank-bm25
+langsmith==0.14.17

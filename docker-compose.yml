@@ -8,6 +8,8 @@ services:
 
     container_name: rag_backend
 
+    user: "1001:1001"
+
     ports:
       - "8000:8000"
 
@@ -16,28 +18,10 @@ services:
 
     environment:
       FRONTEND_URL: ${FRONTEND_URL:-http://localhost:8501}
+      LOCAL_DEV_AUTH_BYPASS: ${LOCAL_DEV_AUTH_BYPASS:-true}
 
     volumes:
       - ./storage:/app/storage
       - ./logs:/app/logs
-
-    restart: unless-stopped
-
-
-  frontend:
-
-    build:
-      context: .
-      dockerfile: Dockerfile.frontend
-      args:
-        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-http://localhost:8000/api}
-
-    container_name: rag_frontend
-
-    ports:
-      - "8501:8501"
-
-    depends_on:
-      - backend
 
     restart: unless-stopped

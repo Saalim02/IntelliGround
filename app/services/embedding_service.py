@@ -1,15 +1,34 @@
+
 from langchain_huggingface import HuggingFaceEmbeddings
+from functools import lru_cache
 
 
-EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+EMBEDDING_MODEL_NAME = "intfloat/multilingual-e5-small"
+
+DOCUMENT_PROMPT = "passage: "
+QUERY_PROMPT = "query: "
+
+NORMALIZE_EMBEDDINGS = True
 
 
+@lru_cache(maxsize=1)
 def get_embedding_model():
     """
-    Loads and returns the Hugging Face embedding model
-    used for semantic search in the RAG pipeline.
+    Returns multilingual E5 embeddings.
+
+    Documents use the passage prefix.
+    Queries use the query prefix.
+    Both use normalized vectors.
     """
-    embeddings = HuggingFaceEmbeddings(
-        model_name=EMBEDDING_MODEL_NAME
+
+    return HuggingFaceEmbeddings(
+        model=EMBEDDING_MODEL_NAME,
+        encode_kwargs={
+            "normalize_embeddings": NORMALIZE_EMBEDDINGS,
+            "prompt": DOCUMENT_PROMPT,
+        },
+        query_encode_kwargs={
+            "normalize_embeddings": NORMALIZE_EMBEDDINGS,
+            "prompt": QUERY_PROMPT,
+        },
     )
-    return embeddings

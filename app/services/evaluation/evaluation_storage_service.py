@@ -1,4 +1,5 @@
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 
 from app.core.config import EVALUATION_DIR
@@ -208,3 +209,28 @@ def append_evaluation_dataset(
         )
 
     return str(dataset_path)
+
+
+def save_user_feedback(
+    *,
+    user_id: int,
+    conversation_id: str,
+    answer_id: int,
+    helpful: bool,
+) -> None:
+    """Persist user sentiment separately from automated evaluations."""
+    feedback_dir = get_user_evaluation_dir(user_id) / "feedback"
+    feedback_dir.mkdir(parents=True, exist_ok=True)
+    path = feedback_dir / f"{int(answer_id)}.json"
+    with open(path, "w", encoding="utf-8") as file:
+        json.dump(
+            {
+                "user_id": user_id,
+                "conversation_id": conversation_id,
+                "answer_id": int(answer_id),
+                "helpful": bool(helpful),
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            },
+            file,
+            indent=2,
+        )

@@ -43,6 +43,38 @@ EVALUATION_MODEL = os.getenv(
     "EVALUATION_MODEL",
     "gpt-4o-mini",
 )
+
+# Gnani Vachana API configuration. These are optional until voice features are
+# configured; values are never returned to the frontend or written to logs.
+GNANI_API_KEY = os.getenv("GNANI_API_KEY", "").strip()
+GNANI_STT_MODEL = os.getenv("GNANI_STT_MODEL", "prisma-v3.0").strip()
+# Provider-supported defaults keep Timbre usable when only GNANI_API_KEY is
+# supplied.  Both values remain environment-overridable for deployments that
+# select another verified voice.
+GNANI_TTS_MODEL = os.getenv("GNANI_TTS_MODEL", "timbre-v2.5").strip()
+GNANI_TTS_VOICE = os.getenv("GNANI_TTS_VOICE", "Kaveri").strip()
+GNANI_STT_URL = os.getenv(
+    "GNANI_STT_URL",
+    "https://api.vachana.ai/stt/v3",
+).strip()
+GNANI_TTS_URL = os.getenv(
+    "GNANI_TTS_URL",
+    "https://api.vachana.ai/api/v1/tts/inference",
+).strip()
+GNANI_STT_WS_URL = os.getenv(
+    "GNANI_STT_WS_URL",
+    "wss://api.vachana.ai/stt/v3/stream",
+).strip()
+GNANI_TTS_WS_URL = os.getenv(
+    "GNANI_TTS_WS_URL",
+    "wss://api.vachana.ai/api/v1/tts",
+).strip()
+GNANI_REQUEST_TIMEOUT_SECONDS = float(
+    os.getenv("GNANI_REQUEST_TIMEOUT_SECONDS", "60")
+)
+GNANI_MAX_AUDIO_BYTES = int(
+    os.getenv("GNANI_MAX_AUDIO_BYTES", str(15 * 1024 * 1024))
+)
 # -----------------------------------
 # APPLICATION URL CONFIGURATION
 # -----------------------------------
@@ -60,6 +92,16 @@ DEVELOPER_ACCESS_PASSWORD = os.getenv(
     "DEVELOPER_ACCESS_PASSWORD",
     "",
 ).strip()
+
+# Local development can use one database-backed identity so all existing
+# user-scoped storage, indexes, conversations, evaluations, and page-image
+# paths continue to work without requiring a browser login. Authentication
+# remains the default unless this flag is explicitly enabled.
+LOCAL_DEV_AUTH_BYPASS = os.getenv(
+    "LOCAL_DEV_AUTH_BYPASS",
+    "false",
+).strip().lower() in {"1", "true", "yes", "on"}
+LOCAL_DEV_EMAIL = "localdev@intelliground.local"
 
 # -----------------------------------
 # REQUIRED ENVIRONMENT VALIDATION

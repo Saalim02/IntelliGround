@@ -4,6 +4,7 @@ import secrets
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
+from app.core.config import LOCAL_DEV_AUTH_BYPASS, LOCAL_DEV_EMAIL
 from app.models.auth_models import User
 
 
@@ -44,6 +45,24 @@ def resolve_authorized_api_key(
     """
 
     require_authenticated_user(user)
+
+    # In local Docker development, the shared local identity may use the
+    # backend-configured OpenAI key without sending the project password to
+    # the browser. This branch is intentionally narrower than the auth
+    # bypass: a normal user account still follows the existing authorization
+    # rules even when the local flag is enabled.
+    if (
+        LOCAL_DEV_AUTH_BYPASS
+        and user.email == LOCAL_DEV_EMAIL
+        and user.auth_provider == "local-dev"
+    ):
+        backend_key = os.getenv("OPENAI_API_KEY", "").strip()
+        if not backend_key:
+            raise HTTPException(
+                status_code=500,
+                detail="Backend OpenAI API key not configured.",
+            )
+        return backend_key
 
     configured_password = os.getenv("RAG_ACCESS_PASSWORD")
 

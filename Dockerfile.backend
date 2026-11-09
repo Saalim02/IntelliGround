@@ -5,6 +5,8 @@ FROM python:3.11-slim
 # -----------------------------------
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
+ENV HOME=/home/appuser
+ENV HF_HOME=/home/appuser/.cache/huggingface
 
 # -----------------------------------
 # WORKING DIRECTORY
@@ -14,19 +16,38 @@ WORKDIR /app
 # -----------------------------------
 # SYSTEM DEPENDENCIES
 # -----------------------------------
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
+    ffmpeg \
+    tesseract-ocr \
+    tesseract-ocr-eng \
+    tesseract-ocr-kan \
+    tesseract-ocr-tam \
+    tesseract-ocr-tel \
+    tesseract-ocr-hin \
+    tesseract-ocr-mal \
+    tesseract-ocr-ben \
+    tesseract-ocr-guj \
+    tesseract-ocr-mar \
+    tesseract-ocr-pan \
+    tesseract-ocr-urd \
+    tesseract-ocr-osd \
     && rm -rf /var/lib/apt/lists/*
 
 # -----------------------------------
-# COPY REQUIREMENTS
+# CREATE NON-ROOT USER
+# -----------------------------------
+RUN groupadd --gid 1001 appgroup \
+    && useradd --uid 1001 --gid 1001 --create-home --shell /usr/sbin/nologin appuser \
+    && mkdir -p /home/appuser/.cache/huggingface \
+    && chown -R appuser:appgroup /home/appuser
+
+# -----------------------------------
+# INSTALL PYTHON DEPENDENCIES
 # -----------------------------------
 COPY requirements.backend.txt .
 
-# -----------------------------------
-# INSTALL DEPENDENCIES
-# -----------------------------------
-RUN pip install --no-cache-dir -r requirements.backend.txt
+RUN pip install --no-cache-dir --default-timeout=300 --retries=10 -r requirements.backend.txt
 
 # -----------------------------------
 # COPY PROJECT FILES
@@ -37,6 +58,11 @@ COPY . .
 # EXPOSE PORT
 # -----------------------------------
 EXPOSE 8000
+
+# -----------------------------------
+# RUN AS NON-ROOT USER
+# -----------------------------------
+USER 1001:1001
 
 # -----------------------------------
 # START FASTAPI

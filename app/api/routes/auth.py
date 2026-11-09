@@ -28,6 +28,13 @@ from app.services.security.auth_rate_limit import (
     REGISTER_RATE_LIMITER,
     check_auth_rate_limit,
 )
+from app.services.security.developer_access import (
+    DEVELOPER_ACCESS_COOKIE,
+    DEVELOPER_ACCESS_MAX_AGE_SECONDS,
+    DEVELOPER_ACCESS_RATE_LIMITER,
+    create_developer_access_token,
+    developer_cookie_secure,
+)
 from app.services.security.auth_service import (
     authenticate_user,
     consume_password_reset_token,
@@ -78,6 +85,7 @@ def to_user_response(user: User) -> UserResponse:
         first_name=first_name,
         last_name=last_name,
         display_name=display_name,
+        onboarding_completed=user.onboarding_completed,
     )
 
 
@@ -223,13 +231,24 @@ def login(
 def logout(response: Response):
     response.delete_cookie(key=AUTH_COOKIE_NAME, path="/")
     response.delete_cookie(key=SESSION_HINT_COOKIE_NAME, path="/")
+    response.delete_cookie(key=DEVELOPER_ACCESS_COOKIE, path="/")
     return {"message": "Signed out successfully."}
+
+
+@router.post("/developer-logout")
+def developer_logout(response: Response):
+    response.delete_cookie(key=DEVELOPER_ACCESS_COOKIE, path="/")
+    return {"message": "Developer access ended."}
 
 @router.post("/developer-access")
 def developer_access(
+    request: Request,
     payload: DeveloperAccessRequest,
     user: User = Depends(get_current_user),
+    response: Response = None,
 ):
+    client_host = request.client.host if request.client else "unknown"
+    check_auth_rate_limit(DEVELOPER_ACCESS_RATE_LIMITER, client_host)
     if not DEVELOPER_ACCESS_PASSWORD:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -251,6 +270,18 @@ def developer_access(
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Developer access denied.",
+        )
+
+    token = create_developer_access_token(user)
+    if response is not None:
+        response.set_cookie(
+            key=DEVELOPER_ACCESS_COOKIE,
+            value=token,
+            max_age=DEVELOPER_ACCESS_MAX_AGE_SECONDS,
+            httponly=True,
+            secure=developer_cookie_secure(),
+            samesite="lax",
+            path="/",
         )
 
     log_security_event(
@@ -630,4 +661,16 @@ async def google_callback(
 def get_me(
     current_user: User = Depends(get_current_user),
 ):
+    return to_user_response(current_user)
+
+
+@router.post("/onboarding/complete", response_model=UserResponse)
+def complete_onboarding(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    current_user.onboarding_completed = True
+    db.add(current_user)
+    db.commit()
+    db.refresh(current_user)
     return to_user_response(current_user)
