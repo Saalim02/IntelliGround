@@ -43,3 +43,28 @@ logs/
 # SSH private keys
 *.pem
 .env
+
+# Local backups and temporary files
+*.backup
+*.bak
+*.tmp
+
+# Test recordings and local screenshots
+test_audio.mp3
+before upload.jpeg
+after upload.jpeg
+
+# Windows metadata
+*:Zone.Identifier
+
+# Frontend dependencies and build output
+node_modules/
+dist/
+coverage/
+
+# Secrets and private credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
