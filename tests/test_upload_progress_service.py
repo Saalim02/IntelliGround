@@ -3,6 +3,7 @@ from app.api.routes import upload as upload_route
 from fastapi import HTTPException
 import pytest
 from types import SimpleNamespace
+from concurrent.futures import ThreadPoolExecutor
 
 
 def test_progress_stage_transitions_and_completion(tmp_path, monkeypatch):
@@ -19,6 +20,42 @@ def test_progress_stage_transitions_and_completion(tmp_path, monkeypatch):
     assert completed["percentage"] == 100
     assert completed["status"] == "completed"
     assert completed["completed_at"]
+
+
+def test_progress_is_monotonic_when_late_stage_updates_arrive(tmp_path, monkeypatch):
+    monkeypatch.setattr(progress, "get_user_storage_dir", lambda _user_id: tmp_path)
+    job_id = progress.normalize_job_id(None)
+    progress.start_job(1, job_id)
+    progress.update_job(1, job_id, 70, "Embedding generation completed")
+    late = progress.update_job(1, job_id, 30, "Late page callback")
+    assert late["percentage"] == 70
+    assert late["status"] == "processing"
+
+
+def test_late_updates_cannot_reopen_completed_or_failed_jobs(tmp_path, monkeypatch):
+    monkeypatch.setattr(progress, "get_user_storage_dir", lambda _user_id: tmp_path)
+    completed_id = progress.normalize_job_id(None)
+    failed_id = progress.normalize_job_id(None)
+    progress.start_job(1, completed_id)
+    progress.start_job(1, failed_id)
+    progress.complete_job(1, completed_id, document_id="doc-complete")
+    progress.fail_job(1, failed_id, "failed")
+    assert progress.update_job(1, completed_id, 40, "late callback")["status"] == "completed"
+    assert progress.update_job(1, failed_id, 100, "late callback")["status"] == "failed"
+    assert progress.complete_job(1, failed_id)["status"] == "failed"
+    assert progress.fail_job(1, completed_id, "late failure")["status"] == "completed"
+
+
+def test_concurrent_updates_to_one_job_do_not_lose_highest_progress(tmp_path, monkeypatch):
+    monkeypatch.setattr(progress, "get_user_storage_dir", lambda _user_id: tmp_path)
+    job_id = progress.normalize_job_id(None)
+    progress.start_job(1, job_id)
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(
+            lambda value: progress.update_job(1, job_id, value, f"stage-{value}"),
+            range(1, 101),
+        ))
+    assert progress.get_job(1, job_id)["percentage"] == 100
 
 
 def test_progress_failure_is_explicit_and_sanitized(tmp_path, monkeypatch):

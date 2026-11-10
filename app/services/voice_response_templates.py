@@ -99,7 +99,7 @@ MESSAGES = {
 NO_DOCUMENT_MESSAGES = {
     "en": {
         "no_document_small_talk": "I’m doing well. I can chat with you, explain how IntelliGround works, or help you explore a PDF after you upload one.",
-        "application_help": "You can upload a PDF with the plus button, then ask questions and review grounded answers with evidence.",
+        "application_help": "I can upload and understand PDFs, summarize them, identify key points, answer grounded questions, explain pages, provide evidence and citations, handle follow-up questions, and interact by voice in the supported languages. Upload a PDF with the plus button to begin.",
         "document_required": "Please upload a PDF first. I’ll explain it in your language, provide supporting evidence, and show the available confidence information.",
     },
     "hi": {"no_document_small_talk": "मैं ठीक हूँ। मैं आपसे बातचीत कर सकता हूँ और IntelliGround का उपयोग समझा सकता हूँ। PDF के बारे में पूछने के लिए पहले उसे अपलोड करें।", "application_help": "प्लस बटन से PDF अपलोड करें, फिर सवाल पूछें और प्रमाण सहित उत्तर देखें।", "document_required": "कृपया पहले एक PDF अपलोड करें। मैं उसे आपकी भाषा में समझाऊँगा, प्रमाण दूँगा और उपलब्ध भरोसे की जानकारी दिखाऊँगा।"},
@@ -135,6 +135,18 @@ def localized_voice_message(language: str | None, kind: str) -> str:
             "kn": "ಹಿಂದಿನ ವಿವರಣೆಯನ್ನು ಮುಂದುವರಿಸಬಹುದು. ಯಾವ ಭಾಗವನ್ನು ಇನ್ನಷ್ಟು ವಿವರಿಸಲಿ?",
             "ta": "முந்தைய விளக்கத்தைத் தொடரலாம். எந்தப் பகுதியை மேலும் விரிவுபடுத்த வேண்டும்?",
             "te": "మునుపటి వివరణను కొనసాగించగలను. ఏ భాగాన్ని మరింత వివరించాలి?",
+        },
+        "wait_for_user": {
+            "en": "Of course. Take your time; I’ll wait.",
+            "kn": "ಖಂಡಿತ. ನಿಮ್ಮ ಸಮಯ ತೆಗೆದುಕೊಳ್ಳಿ; ನಾನು ಕಾಯುತ್ತೇನೆ.",
+            "ta": "நிச்சயமாக. நேரம் எடுத்துக்கொள்ளுங்கள்; நான் காத்திருக்கிறேன்.",
+            "te": "తప్పకుండా. మీ సమయం తీసుకోండి; నేను వేచి ఉంటాను.",
+        },
+        "ready_to_continue": {
+            "en": "Great. I’m ready when you are.",
+            "kn": "ಚೆನ್ನಾಗಿದೆ. ನೀವು ಸಿದ್ಧರಾದಾಗ ನಾನು ಸಿದ್ಧನಿದ್ದೇನೆ.",
+            "ta": "சரி. நீங்கள் தயாரானதும் நான் தயாராக இருக்கிறேன்.",
+            "te": "బాగుంది. మీరు సిద్ధంగా ఉన్నప్పుడు నేను సిద్ధంగా ఉన్నాను.",
         },
     }
     selected = MESSAGES.get(code, MESSAGES["en"]).get(kind)

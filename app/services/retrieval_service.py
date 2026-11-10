@@ -10,7 +10,8 @@ from app.services.bm25_service import document_identity
 from app.services.document_registry_service import get_active_document
 from app.services.rrf_service import reciprocal_rank_fusion
 from app.services.reranker_service import get_reranker
-from app.services.vector_store_service import load_sparse_vectorstore, load_vectorstore
+from app.services.vector_store_service import load_sparse_vectorstore, load_vectorstore, vectorstore_read_lock
+from app.services.embedding_service import embed_query_cached
 from app.services.performance_service import measure
 
 DENSE_CANDIDATE_COUNT = int(os.getenv("DENSE_CANDIDATE_COUNT", "20"))
@@ -92,15 +93,16 @@ def retrieve_relevant_chunks(query: str, user_id: int | None = None):
     if not active_doc:
         return _empty(None, "No active PDF uploaded.")
     active_filename = active_doc["active_filename"]
-    with measure("qa.dense_index_load"):
-        dense_store = load_vectorstore(user_id)
-    if dense_store is None:
-        return _empty(active_filename, "Vector store is empty.")
+    with vectorstore_read_lock(user_id):
+        with measure("qa.dense_index_load"):
+            dense_store = load_vectorstore(user_id)
+        if dense_store is None:
+            return _empty(active_filename, "Vector store is empty.")
 
-    total_chunks = len(dense_store.docstore._dict)
-    legacy_top_k = get_dynamic_top_k(total_chunks)
-    with measure("qa.bm25_index_load"):
-        sparse_store = load_sparse_vectorstore(user_id)
+        total_chunks = len(dense_store.docstore._dict)
+        legacy_top_k = get_dynamic_top_k(total_chunks)
+        with measure("qa.bm25_index_load"):
+            sparse_store = load_sparse_vectorstore(user_id)
     timings = {}
     dense_k = DENSE_CANDIDATE_COUNT if sparse_store else legacy_top_k
     if sparse_store is not None:
@@ -109,7 +111,12 @@ def retrieve_relevant_chunks(query: str, user_id: int | None = None):
         def dense_search():
             started = time.perf_counter()
             with measure("qa.dense_retrieval"):
-                result = dense_store.similarity_search_with_score(query, dense_k)
+                if hasattr(dense_store, "similarity_search_with_score_by_vector"):
+                    result = dense_store.similarity_search_with_score_by_vector(
+                        list(embed_query_cached(query)), dense_k,
+                    )
+                else:
+                    result = dense_store.similarity_search_with_score(query, dense_k)
             stage_times["dense_ms"] = round((time.perf_counter() - started) * 1000, 3)
             return result
 
@@ -128,7 +135,12 @@ def retrieve_relevant_chunks(query: str, user_id: int | None = None):
     else:
         started = time.perf_counter()
         with measure("qa.dense_retrieval"):
-            dense_pairs = dense_store.similarity_search_with_score(query, k=dense_k)
+            if hasattr(dense_store, "similarity_search_with_score_by_vector"):
+                dense_pairs = dense_store.similarity_search_with_score_by_vector(
+                    list(embed_query_cached(query)), k=dense_k,
+                )
+            else:
+                dense_pairs = dense_store.similarity_search_with_score(query, k=dense_k)
         dense_duration_ms = round((time.perf_counter() - started) * 1000, 3)
         sparse_raw = []
         stage_times = {"dense_ms": dense_duration_ms}

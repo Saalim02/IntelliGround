@@ -17,6 +17,10 @@ class QueryRequest(BaseModel):
     conversation_id: Optional[str] = None
     conversation_context: Optional[str] = None
     turn_id: Optional[str] = None
+    # Internal voice-only switch. It is disabled for ordinary HTTP text
+    # queries and keeps deterministic test/adaptor callers backwards
+    # compatible while enabling semantic routing on the live voice path.
+    use_semantic_intent: bool = False
 
 
 class RetrievedChunk(BaseModel):

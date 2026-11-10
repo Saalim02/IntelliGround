@@ -21,6 +21,7 @@ from app.core.config import (
     GNANI_STT_WS_URL,
 )
 from app.services.language_registry import GNANI_VOICE_LANGUAGE_CODES, provider_capability
+from app.services.observability.langsmith_service import observed
 
 
 logger = logging.getLogger(__name__)
@@ -114,6 +115,7 @@ def to_prisma_language(language: str | None) -> str:
     )
 
 
+@observed("voice.stt", voice_stage="stt", provider="gnani_prisma")
 def transcribe_audio(
     audio: bytes,
     *,

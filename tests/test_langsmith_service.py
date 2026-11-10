@@ -8,9 +8,11 @@ from app.services.observability import langsmith_service as service
 @pytest.fixture(autouse=True)
 def clear_client_cache(monkeypatch):
     service._client.cache_clear()
+    service._reset_runtime_state()
     yield
     if hasattr(service._client, "cache_clear"):
         service._client.cache_clear()
+    service._reset_runtime_state()
 
 
 def configure(monkeypatch, enabled="true"):
@@ -85,3 +87,36 @@ def test_safe_trace_preserves_application_exceptions(monkeypatch):
     with pytest.raises(RuntimeError, match="application failure"):
         with service.safe_trace("test_operation"):
             raise RuntimeError("application failure")
+
+
+def test_runtime_toggle_and_metrics_are_safe(monkeypatch):
+    configure(monkeypatch, enabled="false")
+    assert service.set_tracing_enabled(True) is True
+
+    class FakeClient:
+        def create_run(self, **_kwargs): pass
+        def update_run(self, *_args, **_kwargs): pass
+
+    monkeypatch.setattr(service, "_client", lambda: FakeClient())
+    handle = service.start_trace("qa.retrieval", retrieval_stage="qa.retrieval")
+    handle.finish()
+    metrics = service.observability_metrics()
+    assert metrics["available"] is True
+    assert metrics["total_recorded_traces"] == 1
+    assert metrics["successful_runs"] == 1
+    assert metrics["p50_latency_ms"] is not None
+
+
+def test_child_trace_inherits_parent_run(monkeypatch):
+    configure(monkeypatch)
+    calls = []
+
+    class FakeClient:
+        def create_run(self, **kwargs): calls.append(kwargs)
+        def update_run(self, *_args, **_kwargs): pass
+
+    monkeypatch.setattr(service, "_client", lambda: FakeClient())
+    with service.safe_trace("qa.request") as parent:
+        with service.safe_trace("qa.retrieval"):
+            pass
+    assert calls[1]["parent_run_id"] == calls[0]["id"]

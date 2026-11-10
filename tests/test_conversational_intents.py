@@ -1,4 +1,9 @@
-from app.services.voice_intent_service import IntentType, classify_intent
+from app.services.voice_intent_service import (
+    IntentType,
+    SemanticIntentDecision,
+    classify_intent,
+    classify_intent_semantically,
+)
 
 
 def test_conversational_controls_do_not_require_rag_or_evaluation():
@@ -49,3 +54,56 @@ def test_page_marker_extracts_requested_page_without_fabricating_content():
     assert result.intent is IntentType.PAGE_QUERY
     assert result.page_numbers == (999,)
     assert result.as_dict()["referenced_page"] == 999
+
+
+def test_wait_and_ready_are_conversation_actions_without_rag():
+    waiting = classify_intent("Hey, give me a second.")
+    ready = classify_intent("I'm ready now.")
+    assert waiting.intent is IntentType.WAIT_FOR_USER
+    assert waiting.requires_rag is False
+    assert waiting.conversation_action == "WAIT"
+    assert ready.intent is IntentType.READY_TO_CONTINUE
+    assert ready.requires_evaluation is False
+    assert ready.conversation_action == "RESUME"
+
+
+def test_capability_questions_use_application_help_without_rag():
+    result = classify_intent("What can you do?")
+    assert result.intent is IntentType.APPLICATION_HELP
+    assert result.requires_rag is False
+    assert result.requires_evaluation is False
+
+
+def test_semantic_intent_uses_structured_decision_without_answer_generation(monkeypatch):
+    class FakeChain:
+        def invoke(self, _payload):
+            return SemanticIntentDecision(
+                intent="CASUAL_CONVERSATION",
+                intent_confidence=0.96,
+                requires_document=False,
+                requires_rag=False,
+                requires_evaluation=False,
+                conversation_action="RESPOND_CONVERSATIONALLY",
+            )
+
+    class FakePrompt:
+        def __or__(self, _structured):
+            return FakeChain()
+
+    class FakeLlm:
+        def with_structured_output(self, _schema):
+            return self
+
+    monkeypatch.setattr(
+        "app.services.voice_intent_service.ChatPromptTemplate.from_template",
+        lambda _template: FakePrompt(),
+    )
+    monkeypatch.setattr(
+        "app.services.voice_intent_service.get_llm",
+        lambda _api_key: FakeLlm(),
+    )
+    result = classify_intent_semantically("Could you stay with me for a moment?", api_key="test-key")
+    assert result is not None
+    assert result.intent is IntentType.CASUAL_CONVERSATION
+    assert result.requires_rag is False
+    assert result.routing_dict()["conversation_action"] == "RESPOND_CONVERSATIONALLY"

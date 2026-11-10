@@ -11,7 +11,13 @@ from app.services.evaluation.evaluation_storage_service import (
     load_human_review,
     save_human_review,
 )
-from app.services.observability.langsmith_service import tracing_status
+from app.services.observability.langsmith_service import (
+    create_connectivity_trace,
+    instrumentation_coverage,
+    observability_metrics,
+    set_tracing_enabled,
+    tracing_status,
+)
 from app.services.security.developer_access import get_developer_user
 from app.services.security.document_guardrails import inspect_retrieved_chunks
 from app.services.security.guardrails import validate_question
@@ -24,6 +30,10 @@ router = APIRouter(prefix="/developer", tags=["Developer Settings"])
 class GuardrailTestRequest(BaseModel):
     question: str = Field(min_length=1, max_length=4000)
     document_text: str = Field(default="", max_length=12000)
+
+
+class ObservabilityToggleRequest(BaseModel):
+    enabled: bool | None = None
 
 
 def _evaluation_summary(evaluation, review):
@@ -50,10 +60,45 @@ def developer_dashboard(user: User = Depends(get_developer_user)):
         "counts": {"evaluations": len(records), "pending_reviews": len(pending)},
         "observability": {
             **tracing_status(),
-            "trace_verified": False,
-            "trace_note": "No real application trace has been verified yet.",
+            "metrics": observability_metrics(),
+            "coverage": instrumentation_coverage(),
+            "trace_verified": observability_metrics()["total_recorded_traces"] > 0,
+            "trace_note": "Metrics are process-local and unavailable after a backend restart." if observability_metrics()["available"] else "No trace has been recorded in this backend process.",
         },
     }
+
+
+@router.get("/observability")
+def observability_dashboard(user: User = Depends(get_developer_user)):
+    del user
+    status = tracing_status()
+    metrics = observability_metrics()
+    return {
+        "status": status,
+        "metrics": metrics,
+        "coverage": instrumentation_coverage(),
+        "trace_verified": metrics["total_recorded_traces"] > 0,
+    }
+
+
+@router.post("/observability/test")
+def test_observability(user: User = Depends(get_developer_user)):
+    del user
+    return {
+        "status": "success" if create_connectivity_trace() else "unavailable",
+        "configuration": tracing_status(),
+        "metrics": observability_metrics(),
+    }
+
+
+@router.post("/observability/toggle")
+def toggle_observability(
+    request: ObservabilityToggleRequest,
+    user: User = Depends(get_developer_user),
+):
+    del user
+    set_tracing_enabled(request.enabled)
+    return {"status": "success", "configuration": tracing_status()}
 
 
 @router.post("/evaluations/{evaluation_id}/review")

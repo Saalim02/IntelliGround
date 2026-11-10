@@ -225,6 +225,7 @@ async def voice_turn(
             response_language=voice_language,
             conversation_id=conversation.id,
             conversation_context=context or None,
+            use_semantic_intent=True,
         )
         result = await asyncio.to_thread(run_document_query, request, current_user, endpoint="/api/voice")
         logger.info("voice_rag_complete user_id=%s conversation_id=%s status=%s", current_user.id, conversation_id, result.get("status"))
@@ -522,6 +523,7 @@ async def _process_stream_turn(websocket, user, conversation_id, transcript, aut
             response_language=voice_language,
             conversation_id=conversation.id,
             conversation_context=context or None,
+            use_semantic_intent=True,
         )
         result = await asyncio.to_thread(run_document_query, request, user, endpoint="/api/voice")
         logger.info("voice_rag_complete user_id=%s conversation_id=%s status=%s", user.id, conversation_id, result.get("status"))

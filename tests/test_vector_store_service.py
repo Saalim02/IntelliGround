@@ -1,5 +1,7 @@
 
 import json
+import threading
+import time
 from pathlib import Path
 
 from app.services import vector_store_service
@@ -457,3 +459,81 @@ def test_sparse_index_loader_reuses_unchanged_committed_index(tmp_path, monkeypa
     assert vector_store_service.load_sparse_vectorstore(7) is loaded
     assert vector_store_service.load_sparse_vectorstore(7) is loaded
     assert calls == [tmp_path]
+
+
+def _write_cached_index_fixture(directory: Path):
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / vector_store_service.EMBEDDING_MANIFEST_FILENAME).write_text(
+        json.dumps(vector_store_service._get_embedding_manifest()), encoding="utf-8"
+    )
+    for name in ("index.faiss", "index.pkl", "sparse_index.json"):
+        (directory / name).write_text(name, encoding="utf-8")
+
+
+def test_faiss_cache_is_user_document_scoped_and_invalidates_on_replacement(tmp_path, monkeypatch):
+    calls = []
+    roots = {1: tmp_path / "user-1" / "vectorstore", 2: tmp_path / "user-2" / "vectorstore"}
+    for root in roots.values():
+        _write_cached_index_fixture(root)
+    active = {1: {"active_doc_id": "doc-a"}, 2: {"active_doc_id": "doc-a"}}
+    monkeypatch.setattr(vector_store_service, "get_user_vectorstore_dir", lambda user_id: roots[user_id])
+    monkeypatch.setattr(vector_store_service, "get_active_document", lambda user_id: active[user_id])
+    monkeypatch.setattr(vector_store_service, "get_embedding_model", lambda: object())
+    monkeypatch.setattr(
+        vector_store_service.FAISS,
+        "load_local",
+        lambda directory, *_args, **_kwargs: calls.append(directory) or object(),
+    )
+    vector_store_service._load_vectorstore_cached.cache_clear()
+
+    first = vector_store_service.load_vectorstore(1)
+    assert vector_store_service.load_vectorstore(1) is first
+    assert vector_store_service.load_vectorstore(2) is not first
+    assert len(calls) == 2
+
+    replacement = roots[1] / "index.pkl"
+    replacement.write_text("replacement-metadata", encoding="utf-8")
+    assert vector_store_service.load_vectorstore(1) is not first
+    assert len(calls) == 3
+
+
+def test_faiss_reader_lock_blocks_transactional_replacement(tmp_path, monkeypatch):
+    vector_dir = tmp_path / "user" / "vectorstore"
+    _write_cached_index_fixture(vector_dir)
+    started = threading.Event()
+    release = threading.Event()
+    writer_done = threading.Event()
+    monkeypatch.setattr(vector_store_service, "get_user_vectorstore_dir", lambda _user_id: vector_dir)
+    monkeypatch.setattr(vector_store_service, "get_active_document", lambda _user_id: {"active_doc_id": "doc-a"})
+    monkeypatch.setattr(vector_store_service, "get_embedding_model", lambda: object())
+
+    def fake_load(*_args, **_kwargs):
+        started.set()
+        assert release.wait(2)
+        return object()
+
+    monkeypatch.setattr(vector_store_service.FAISS, "load_local", fake_load)
+    vector_store_service._load_vectorstore_cached.cache_clear()
+
+    reader = threading.Thread(target=lambda: vector_store_service.load_vectorstore(1))
+    reader.start()
+    assert started.wait(2)
+
+    staged = tmp_path / "staged"
+    _write_cached_index_fixture(staged)
+
+    def replace():
+        transaction = vector_store_service.VectorStoreTransaction(vector_dir, staged)
+        with transaction:
+            transaction.install()
+            transaction.mark_committed()
+        writer_done.set()
+
+    writer = threading.Thread(target=replace)
+    writer.start()
+    time.sleep(0.05)
+    assert not writer_done.is_set()
+    release.set()
+    reader.join(2)
+    writer.join(2)
+    assert writer_done.is_set()

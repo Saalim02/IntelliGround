@@ -14,6 +14,7 @@ from app.services.document_intelligence_service import (
     generate_document_topics,
     save_response_language,
 )
+from app.services.document_registry_service import get_active_document
 from app.services.security.auth_dependencies import get_current_user
 from app.services.security.rag_authorization import resolve_authorized_api_key
 from app.services.language_registry import validate_language
@@ -24,6 +25,13 @@ router = APIRouter(prefix="/document", tags=["Document Intelligence"])
 @router.post("/language", response_model=DocumentLanguageResponse)
 def set_document_language(request: DocumentLanguageRequest, current_user: User = Depends(get_current_user)):
     return save_response_language(current_user.id, request.response_language)
+
+
+@router.get("/current")
+def current_document(current_user: User = Depends(get_current_user)):
+    """Return the authenticated user's active document metadata for UI restore."""
+    active = get_active_document(current_user.id)
+    return {"status": "success", "document": active}
 
 
 def _api_key(request: DocumentLanguageRequest, current_user: User) -> str:

@@ -109,14 +109,14 @@ async def upload_pdf(
         # -----------------------------------
         # VALIDATE PDF
         # -----------------------------------
-        with measure("ingestion.validation"):
+        with measure("ingestion.validation", job_id=job_id, document_id=doc_id, user_id=current_user.id):
             await validate_pdf_file(file)
         update_job(current_user.id, job_id, 10, "PDF received and validated")
 
         # -----------------------------------
         # SAVE PDF
         # -----------------------------------
-        with measure("ingestion.upload_save"):
+        with measure("ingestion.upload_save", job_id=job_id, document_id=doc_id, user_id=current_user.id):
             (
                 original_filename,
                 saved_path,
@@ -127,7 +127,7 @@ async def upload_pdf(
         # EXTRACT PDF TEXT
         # -----------------------------------
         try:
-            with measure("ingestion.extraction"):
+            with measure("ingestion.extraction", job_id=job_id, document_id=doc_id, user_id=current_user.id):
                 pdf_data = await asyncio.to_thread(
                     extract_text_from_pdf, saved_path, language_hint=language,
                 )
@@ -146,8 +146,9 @@ async def upload_pdf(
             page["text"]
             for page in pages_data
         )
-        detected_evidence_language = detect_text_language(extracted_text)["language"]
-        if detected_evidence_language in {"und", "mixed"}:
+        with measure("ingestion.language_detection", job_id=job_id, document_id=doc_id, user_id=current_user.id):
+            detected_evidence_language = detect_text_language(extracted_text)["language"]
+        if detected_evidence_language == "und":
             detected_evidence_language = {
                 "hin": "hi", "kan": "kn", "tam": "ta", "tel": "te",
                 "mal": "ml", "mar": "mr", "guj": "gu", "ben": "bn",
@@ -195,16 +196,16 @@ async def upload_pdf(
         # DOCUMENT ID
         # -----------------------------------
         doc_id = str(uuid.uuid4())
-        update_job(current_user.id, job_id, 35, "Text cleaned and chunked", document_id=doc_id)
+        update_job(current_user.id, job_id, 22, "PDF text ready", document_id=doc_id)
 
         # -----------------------------------
         # GENERATE PAGE IMAGES
         # -----------------------------------
-        with measure("ingestion.page_images"):
+        with measure("ingestion.page_images", job_id=job_id, document_id=doc_id, user_id=current_user.id):
             await asyncio.to_thread(
                 generate_page_images, saved_path, doc_id, user_id=current_user.id,
                 progress_callback=lambda completed, total: update_job(
-                    current_user.id, job_id, 20 + round(10 * completed / total),
+                    current_user.id, job_id, 22 + round(13 * completed / total),
                     f"Processing page images ({completed}/{total})", document_id=doc_id,
                 ),
             )
@@ -212,18 +213,20 @@ async def upload_pdf(
         # -----------------------------------
         # SAVE SUMMARY SOURCE
         # -----------------------------------
-        with measure("ingestion.summary_source_persistence"):
+        with measure("ingestion.summary_source_persistence", job_id=job_id, document_id=doc_id, user_id=current_user.id):
             await asyncio.to_thread(
                 save_summary_source, doc_id, extracted_text, user_id=current_user.id,
             )
+        update_job(current_user.id, job_id, 38, "Document text persisted", document_id=doc_id)
 
         # -----------------------------------
         # BUILD CHUNK METADATA
         # -----------------------------------
-        with measure("ingestion.chunking_metadata"):
+        with measure("ingestion.chunking_metadata", job_id=job_id, document_id=doc_id, user_id=current_user.id):
             metadata, chunk_configs = await asyncio.to_thread(
                 build_chunk_metadata, pages_data, original_filename, doc_id,
             )
+        update_job(current_user.id, job_id, 45, "Chunks created", document_id=doc_id)
 
         # -----------------------------------
         # CONVERT TO LANGCHAIN DOCUMENTS
@@ -233,6 +236,7 @@ async def upload_pdf(
             metadata,
             original_filename,
         )
+        update_job(current_user.id, job_id, 48, "Retrieval documents prepared", document_id=doc_id)
 
         if not documents:
             raise HTTPException(
@@ -247,19 +251,19 @@ async def upload_pdf(
         # CREATE AND SAVE VECTOR STORE
         # -----------------------------------
         previous_registry = get_active_document(current_user.id)
-        with measure("ingestion.embedding_and_index_build"):
+        with measure("ingestion.embedding_and_index_build", job_id=job_id, document_id=doc_id, user_id=current_user.id):
             vectorstore_transaction = await asyncio.to_thread(
                 begin_vectorstore_transaction, documents, user_id=current_user.id,
             )
-        update_job(current_user.id, job_id, 50, "Embedding generation completed", document_id=doc_id)
+        update_job(current_user.id, job_id, 75, "Embeddings and indexes created", document_id=doc_id)
         vectorstore_transaction.__enter__()
         vectorstore_transaction.install()
-        update_job(current_user.id, job_id, 75, "Vector and BM25 indexes installed", document_id=doc_id)
+        update_job(current_user.id, job_id, 80, "Vector and BM25 indexes installed", document_id=doc_id)
 
         # -----------------------------------
         # EXPORT DEBUG FILES
         # -----------------------------------
-        with measure("ingestion.debug_metadata_export"):
+        with measure("ingestion.debug_metadata_export", job_id=job_id, document_id=doc_id, user_id=current_user.id):
             debug_transaction = await asyncio.to_thread(
                 export_debug_files, original_filename, pages_data, metadata,
                 user_id=current_user.id, commit=False,
@@ -268,7 +272,7 @@ async def upload_pdf(
         # Install both filesystem replacements before changing the registry.
         # Their backups remain available until every state change succeeds.
         debug_transaction.install()
-        update_job(current_user.id, job_id, 90, "Metadata and page-image processing completed", document_id=doc_id)
+        update_job(current_user.id, job_id, 93, "Metadata and page-image processing completed", document_id=doc_id)
 
         # -----------------------------------
         # ACTIVE DOCUMENT REGISTRY

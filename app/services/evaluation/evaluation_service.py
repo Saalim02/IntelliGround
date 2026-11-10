@@ -38,6 +38,7 @@ from app.services.security.document_guardrails import (
 from app.services.security.audit_logger import (
     log_security_event,
 )
+from app.services.observability.langsmith_service import observed
 
 def _extract_claims(answer: str) -> List[str]:
     """
@@ -96,6 +97,7 @@ def _build_reasons(
     return reasons
 
 
+@observed("qa.evaluation")
 def evaluate_rag_response(
     question: str,
     answer: str,

@@ -1,6 +1,8 @@
 """Shared document-question orchestration for text and voice interfaces."""
 
 import inspect
+import os
+from uuid import uuid4
 
 from app.models.auth_models import User
 from app.models.evaluation_models import EvaluationDecision
@@ -21,10 +23,16 @@ from app.services.security.audit_logger import log_security_event
 from app.services.security.guardrails import validate_question
 from app.services.security.rag_authorization import resolve_authorized_api_key
 from app.services.security.semantic_guardrail import classify_question_semantically
-from app.services.voice_intent_service import classify_intent, classify_voice_intent
+from app.services.voice_intent_service import (
+    classify_intent,
+    classify_intent_semantically,
+    classify_voice_intent,
+    generate_conversational_response,
+)
 from app.services.conversation_resolution_service import resolve_follow_up
 from app.services.voice_response_templates import localized_voice_message
-from app.services.performance_service import measure
+from app.services.performance_service import measure, performance_context
+from app.services.observability.langsmith_service import observed
 
 
 def classify_question(confidence: str) -> str:
@@ -113,6 +121,11 @@ def _response_question_type(intent_name: str) -> str:
     }.get(intent_name, intent_name)
 
 
+def _needs_semantic_intent(intent) -> bool:
+    """Use the LLM only for ambiguous or low-confidence local routes."""
+    return intent.intent.value in {"DOCUMENT_QUERY", "AMBIGUOUS_QUERY"} or intent.confidence < 0.80
+
+
 def _last_assistant_answer(context: str | None) -> str | None:
     """Read only the last persisted answer for voice continuation/repetition."""
     lines = [line.strip() for line in (context or "").splitlines() if line.strip()]
@@ -124,10 +137,10 @@ def _last_assistant_answer(context: str | None) -> str | None:
     return None
 
 
-def _no_document_voice_response(request: QueryRequest, intent=None) -> dict:
+def _no_document_voice_response(request: QueryRequest, intent=None, *, conversational_answer: str | None = None) -> dict:
     """Handle voice conversation before any document retrieval is possible."""
     if intent is not None and not intent.requires_retrieval:
-        return _intent_response(request, intent, endpoint="/api/voice")
+        return _intent_response(request, intent, endpoint="/api/voice", conversational_answer=conversational_answer)
     kind = classify_voice_intent(request.question)
     intent_name = getattr(getattr(intent, "intent", None), "value", None)
     if intent_name == "GREETING" or kind == "greeting":
@@ -158,7 +171,7 @@ def _no_document_voice_response(request: QueryRequest, intent=None) -> dict:
     }
 
 
-def _intent_response(request: QueryRequest, intent, *, endpoint: str) -> dict:
+def _intent_response(request: QueryRequest, intent, *, endpoint: str, conversational_answer: str | None = None) -> dict:
     """Return a contract-compatible response for non-retrieval intents."""
     intent_name = intent.intent.value
     if intent_name == "GREETING":
@@ -169,7 +182,7 @@ def _intent_response(request: QueryRequest, intent, *, endpoint: str) -> dict:
             "active_document": None,
             "question": request.question,
             "question_type": "CONVERSATIONAL" if endpoint == "/api/voice" else intent.intent.value,
-            "answer": localized_voice_message(request.response_language, response_kind),
+            "answer": conversational_answer or localized_voice_message(request.response_language, response_kind),
             "confidence": None, "best_score": None, "average_score": None,
             "evidence": [], "retrieved_chunks": [], "evaluation": None,
             "message": (
@@ -184,7 +197,7 @@ def _intent_response(request: QueryRequest, intent, *, endpoint: str) -> dict:
             "active_document": None,
             "question": request.question,
             "question_type": "GENERAL_CONVERSATION",
-            "answer": localized_voice_message(request.response_language, "small_talk"),
+            "answer": conversational_answer or localized_voice_message(request.response_language, "small_talk"),
             "confidence": None, "best_score": None, "average_score": None,
             "evidence": [], "retrieved_chunks": [], "evaluation": None,
             "message": "Conversational response generated.",
@@ -197,12 +210,16 @@ def _intent_response(request: QueryRequest, intent, *, endpoint: str) -> dict:
             "evidence": [], "retrieved_chunks": [], "evaluation": None,
             "message": "Audio check response generated.",
         }
-    if intent_name in {"ACKNOWLEDGMENT", "CONTINUE_RESPONSE", "REPEAT_RESPONSE"}:
+    if intent_name in {"ACKNOWLEDGMENT", "CONTINUE_RESPONSE", "REPEAT_RESPONSE", "WAIT_FOR_USER", "READY_TO_CONTINUE"}:
         previous = _last_assistant_answer(request.conversation_context)
         if intent_name == "REPEAT_RESPONSE" and previous:
             answer = previous
         elif intent_name == "CONTINUE_RESPONSE" and previous:
             answer = localized_voice_message(request.response_language, "continue_response")
+        elif intent_name == "WAIT_FOR_USER":
+            answer = localized_voice_message(request.response_language, "wait_for_user")
+        elif intent_name == "READY_TO_CONTINUE":
+            answer = localized_voice_message(request.response_language, "ready_to_continue")
         else:
             answer = localized_voice_message(request.response_language, "acknowledgment")
         return {
@@ -278,6 +295,7 @@ def _direct_page_retrieval_output(page_output: dict) -> dict:
     }
 
 
+@observed("qa.request")
 def run_document_query(
     request: QueryRequest,
     current_user: User,
@@ -354,13 +372,31 @@ def run_document_query(
     if "response_language" in classify_parameters:
         classify_kwargs["response_language"] = request.response_language
     intent = classify(request.question, **classify_kwargs)
+    semantic_intent_enabled = bool(request.use_semantic_intent and endpoint == "/api/voice")
 
     # Classify before checking document availability. Voice conversation and
     # application help do not need an API key, semantic RAG guardrail, or PDF.
     if endpoint == "/api/voice":
         active_document = get_active(current_user.id)
         if not active_document:
-            return _no_document_voice_response(request, intent)
+            if semantic_intent_enabled and intent.requires_retrieval and _needs_semantic_intent(intent):
+                semantic = classify_intent_semantically(
+                    request.question,
+                    api_key=os.getenv("OPENAI_API_KEY", ""),
+                    conversation_context=request.conversation_context,
+                    response_language=request.response_language,
+                )
+                if semantic is not None:
+                    intent = semantic
+            conversational_answer = None
+            if intent.intent.value in {"CASUAL_CONVERSATION", "GENERAL_CONVERSATION"}:
+                conversational_answer = generate_conversational_response(
+                    request.question,
+                    api_key=os.getenv("OPENAI_API_KEY", ""),
+                    conversation_context=request.conversation_context,
+                    response_language=request.response_language,
+                )
+            return _no_document_voice_response(request, intent, conversational_answer=conversational_answer)
         if not intent.requires_retrieval:
             return _intent_response(request, intent, endpoint=endpoint)
 
@@ -369,6 +405,17 @@ def run_document_query(
         access_password=request.access_password,
         user_openai_api_key=request.user_openai_api_key,
     )
+
+    if semantic_intent_enabled and intent.requires_retrieval and _needs_semantic_intent(intent):
+        semantic = classify_intent_semantically(
+            request.question,
+            api_key=api_key,
+            conversation_context=request.conversation_context,
+            active_document_id=(get_active(current_user.id) or {}).get("active_doc_id"),
+            response_language=request.response_language,
+        )
+        if semantic is not None:
+            intent = semantic
 
     semantic_security_result = semantic_classify(
         question=request.question,
@@ -392,6 +439,20 @@ def run_document_query(
             },
         )
 
+    # A semantic decision may identify a conversational utterance that the
+    # local fallback could not recognize. It bypasses RAG/evaluation only
+    # after the existing semantic security guardrail has allowed it.
+    if endpoint == "/api/voice" and not intent.requires_retrieval:
+        conversational_answer = None
+        if intent.intent.value in {"CASUAL_CONVERSATION", "GENERAL_CONVERSATION"} and semantic_intent_enabled:
+            conversational_answer = generate_conversational_response(
+                request.question,
+                api_key=api_key,
+                conversation_context=request.conversation_context,
+                response_language=request.response_language,
+            )
+        return _intent_response(request, intent, endpoint=endpoint, conversational_answer=conversational_answer)
+
     if not intent.requires_retrieval:
         return _intent_response(request, intent, endpoint=endpoint)
 
@@ -411,16 +472,25 @@ def run_document_query(
                 f"Current user question:\n{request.question}"
             )
 
+    active_doc = get_active(current_user.id)
+    active_doc_id = active_doc["active_doc_id"] if active_doc else None
+    timing_fields = {
+        "request_id": request.turn_id or f"query-{uuid4().hex}",
+        "user_id": current_user.id,
+        "document_id": active_doc_id,
+    }
     if intent.intent.value == "PAGE_QUERY" or resolved_pages:
-        with measure("qa.direct_page_retrieval"):
-            page_output = retrieve_pages_for_user(
-                intent.page_numbers or resolved_pages,
-                user_id=current_user.id,
-            )
+        with performance_context(**timing_fields):
+            with measure("qa.direct_page_retrieval"):
+                page_output = retrieve_pages_for_user(
+                    intent.page_numbers or resolved_pages,
+                    user_id=current_user.id,
+                )
         retrieval_output = _direct_page_retrieval_output(page_output)
     else:
-        with measure("qa.retrieval_pipeline"):
-            retrieval_output = retrieve(query_text, user_id=current_user.id)
+        with performance_context(**timing_fields):
+            with measure("qa.retrieval_pipeline"):
+                retrieval_output = retrieve(query_text, user_id=current_user.id)
     if retrieval_output["status"] != "success":
         page_error_message = None
         if retrieval_output.get("invalid_pages") and retrieval_output.get("total_pages"):
@@ -447,9 +517,6 @@ def run_document_query(
         retrieval_output["evaluation"] = None
         return retrieval_output
 
-    active_doc = get_active(current_user.id)
-    active_doc_id = active_doc["active_doc_id"] if active_doc else None
-
     if retrieval_output["confidence"] == "low":
         return _unanswerable_response(
             retrieval_output, request.question,
@@ -475,7 +542,9 @@ def run_document_query(
         answer_kwargs["response_language"] = request.response_language
     if accepts_kwargs or "conversation_context" in answer_parameters:
         answer_kwargs["conversation_context"] = request.conversation_context
-    final_answer = generate_answer(**answer_kwargs)
+    with performance_context(**timing_fields):
+        with measure("qa.answer_generation"):
+            final_answer = generate_answer(**answer_kwargs)
     if not final_answer or final_answer.strip() == "Answer not found in uploaded PDF.":
         return _unanswerable_response(
             retrieval_output,
@@ -515,12 +584,13 @@ def run_document_query(
                     }
                 )
 
-    with measure("qa.grounding_and_citation_validation"):
-        evaluation = evaluate(
-            question=query_text, answer=final_answer,
-            retrieved_chunks=retrieved_chunks, evidence=evidence,
-            api_key=api_key, use_llm_judges=True,
-        )
+    with performance_context(**timing_fields):
+        with measure("qa.grounding_and_citation_validation"):
+            evaluation = evaluate(
+                question=query_text, answer=final_answer,
+                retrieved_chunks=retrieved_chunks, evidence=evidence,
+                api_key=api_key, use_llm_judges=True,
+            )
     evaluation.user_id = current_user.id
     persist_evaluation(evaluation, user_id=current_user.id)
 

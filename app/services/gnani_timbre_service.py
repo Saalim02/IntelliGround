@@ -12,6 +12,7 @@ import websockets
 
 from app.core.config import GNANI_API_KEY, GNANI_REQUEST_TIMEOUT_SECONDS, GNANI_TTS_MODEL, GNANI_TTS_URL, GNANI_TTS_VOICE, GNANI_TTS_WS_URL
 from app.services.gnani_prisma_service import VOICE_LANGUAGE_CODES, GnaniConfigurationError, GnaniProviderError
+from app.services.observability.langsmith_service import observed
 
 
 def _validate(text: str, language: str) -> None:
@@ -27,6 +28,7 @@ def _payload(text: str, language: str, container: str) -> dict:
     return {"text": text, "voice": GNANI_TTS_VOICE, "model": GNANI_TTS_MODEL, "language": VOICE_LANGUAGE_CODES[language], "audio_config": {"sample_rate": 48000, "num_channels": 1, "sample_width": 2, "encoding": "linear_pcm", "container": container}}
 
 
+@observed("voice.tts", voice_stage="tts", provider="gnani_timbre")
 def synthesize_speech(text: str, *, language: str) -> tuple[bytes, str]:
     """Buffered REST synthesis used by non-realtime callers and fallback."""
     _validate(text, language)

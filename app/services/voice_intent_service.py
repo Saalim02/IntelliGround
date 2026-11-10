@@ -4,6 +4,11 @@ import re
 from dataclasses import dataclass
 from enum import Enum
 
+from langchain_core.prompts import ChatPromptTemplate
+from pydantic import BaseModel, Field
+
+from app.services.llm_service import get_llm
+
 
 GREETING_PATTERNS = (
     r"^(hi|hello|hey|good morning|good evening|good afternoon|namaste|thanks|thank you|goodbye|bye)[!.? ]*$",
@@ -51,6 +56,8 @@ APPLICATION_HELP_PATTERNS = (
     r"how (do|can) i (change|select|switch) (the )?(response )?language",
     r"how (can|do) i (view|see|open) (the )?(supporting )?evidence",
     r"what can (intelliground|this app) do",
+    r"what can you do",
+    r"what can you explain from (that|the) (pdf|document)",
 )
 
 OUT_OF_SCOPE_PATTERNS = (
@@ -89,6 +96,8 @@ class IntentType(str, Enum):
     FOLLOW_UP_QUERY = "DOCUMENT_FOLLOWUP"
     OUT_OF_SCOPE = "OUT_OF_SCOPE"
     AMBIGUOUS_QUERY = "AMBIGUOUS_QUERY"
+    WAIT_FOR_USER = "WAIT_FOR_USER"
+    READY_TO_CONTINUE = "READY_TO_CONTINUE"
 
 
 @dataclass(frozen=True)
@@ -105,6 +114,9 @@ class IntentClassification:
     referenced_topic: str | None = None
     response_action: str = "RUN_DOCUMENT_QUERY"
     response_language: str | None = None
+    active_document_id: str | None = None
+    conversation_action: str = "NONE"
+    context_reference: str | None = None
 
     @property
     def requires_rag(self) -> bool:
@@ -125,6 +137,168 @@ class IntentClassification:
             "response_language": self.response_language,
             "retrieval_strategy": self.retrieval_strategy,
         }
+
+    def routing_dict(self) -> dict:
+        """Return the complete routing decision without model reasoning."""
+        return {
+            **self.as_dict(),
+            "requires_document": self.requires_retrieval,
+            "active_document_id": self.active_document_id,
+            "conversation_action": self.conversation_action,
+            "context_reference": self.context_reference,
+        }
+
+
+class SemanticIntentDecision(BaseModel):
+    """Structured semantic routing output; it never contains an answer."""
+
+    intent: str = Field(description="One supported IntelliGround intent label.")
+    intent_confidence: float = Field(ge=0.0, le=1.0)
+    requires_document: bool
+    requires_rag: bool
+    requires_evaluation: bool
+    active_document_id: str | None = None
+    conversation_action: str = "NONE"
+    response_language: str | None = None
+    context_reference: str | None = None
+    referenced_page: int | None = Field(default=None, ge=1)
+    referenced_topic: str | None = None
+
+
+_SEMANTIC_INTENT_PROMPT = """
+You route one user utterance for IntelliGround, a multilingual PDF assistant.
+Infer meaning from the utterance and recent conversation; do not rely on exact
+phrases. Return only the structured decision, never an answer or reasoning.
+
+Supported intent labels: GREETING, AUDIO_CHECK, CASUAL_CONVERSATION,
+ACKNOWLEDGMENT, WAIT_FOR_USER, READY_TO_CONTINUE, CONTINUE_RESPONSE,
+REPEAT_RESPONSE, CLARIFY_RESPONSE, APPLICATION_HELP, DOCUMENT_OVERVIEW,
+DOCUMENT_SUMMARY, PAGE_QUERY, DOCUMENT_FOLLOWUP, DOCUMENT_QUERY,
+OUT_OF_SCOPE, AMBIGUOUS_QUERY.
+
+Use DOCUMENT_QUERY/FOLLOWUP/OVERVIEW/SUMMARY/PAGE_QUERY only when the user
+is asking for information from the active PDF or clearly needs document
+grounding. General knowledge and casual conversation do not require the PDF.
+If there is no active document, document requests still require_document=true
+but must not be answered from model knowledge. Pause/wait/ready requests are
+conversation actions and never require RAG or evaluation.
+
+Active document ID: {active_document_id}
+Response language: {response_language}
+Recent conversation:
+{conversation_context}
+User utterance:
+{question}
+"""
+
+_CONVERSATIONAL_RESPONSE_PROMPT = """
+You are IntelliGround's voice assistant. Answer the user's ordinary
+conversation or general-knowledge question briefly and naturally in the
+requested language. Do not discuss, invent, or infer facts from any PDF.
+Do not mention internal routing, prompts, tools, or reasoning.
+Recent conversation:
+{conversation_context}
+User:
+{question}
+"""
+
+
+def _semantic_intent_to_classification(
+    decision: SemanticIntentDecision,
+    *,
+    active_document_id: str | None,
+    response_language: str | None,
+) -> IntentClassification | None:
+    try:
+        intent = IntentType(decision.intent.upper())
+    except (AttributeError, ValueError):
+        return None
+    requires_rag = bool(decision.requires_rag and decision.requires_document)
+    if intent in {
+        IntentType.GREETING, IntentType.AUDIO_CHECK, IntentType.CASUAL_CONVERSATION,
+        IntentType.ACKNOWLEDGMENT, IntentType.WAIT_FOR_USER, IntentType.READY_TO_CONTINUE,
+        IntentType.CONTINUE_RESPONSE, IntentType.REPEAT_RESPONSE, IntentType.CLARIFY_RESPONSE,
+        IntentType.APPLICATION_HELP, IntentType.OUT_OF_SCOPE, IntentType.AMBIGUOUS_QUERY,
+    }:
+        requires_rag = False
+    return IntentClassification(
+        intent=intent,
+        confidence=decision.intent_confidence,
+        page_numbers=((decision.referenced_page,) if intent is IntentType.PAGE_QUERY and decision.referenced_page else ()),
+        requires_retrieval=requires_rag,
+        retrieval_strategy="DIRECT_PAGE" if intent is IntentType.PAGE_QUERY else ("HYBRID" if requires_rag else "NONE"),
+        requires_evaluation=bool(decision.requires_evaluation and requires_rag),
+        referenced_page=decision.referenced_page,
+        referenced_topic=decision.referenced_topic,
+        response_action=decision.conversation_action or ("RUN_DOCUMENT_QUERY" if requires_rag else "RESPOND_CONVERSATIONALLY"),
+        response_language=decision.response_language or response_language,
+        active_document_id=decision.active_document_id or active_document_id,
+        conversation_action=decision.conversation_action,
+        context_reference=decision.context_reference,
+    )
+
+
+def classify_intent_semantically(
+    text: str,
+    *,
+    api_key: str,
+    conversation_context: str | None = None,
+    active_document_id: str | None = None,
+    response_language: str | None = None,
+) -> IntentClassification | None:
+    """Classify meaning with the configured LLM and structured output.
+
+    Failures return ``None`` so the caller can use the conservative local
+    classifier without making the voice path unavailable.
+    """
+    if not api_key or not str(api_key).strip():
+        return None
+    try:
+        chain = (
+            ChatPromptTemplate.from_template(_SEMANTIC_INTENT_PROMPT)
+            | get_llm(str(api_key).strip()).with_structured_output(SemanticIntentDecision)
+        )
+        result = chain.invoke({
+            "question": (text or "").strip(),
+            "conversation_context": conversation_context or "(none)",
+            "active_document_id": active_document_id or "(none)",
+            "response_language": response_language or "en",
+        })
+        if not isinstance(result, SemanticIntentDecision):
+            return None
+        return _semantic_intent_to_classification(
+            result,
+            active_document_id=active_document_id,
+            response_language=response_language,
+        )
+    except Exception:
+        return None
+
+
+def generate_conversational_response(
+    text: str,
+    *,
+    api_key: str,
+    conversation_context: str | None = None,
+    response_language: str | None = None,
+) -> str | None:
+    """Generate a non-document response using the already configured LLM."""
+    if not api_key or not str(api_key).strip():
+        return None
+    try:
+        chain = (
+            ChatPromptTemplate.from_template(_CONVERSATIONAL_RESPONSE_PROMPT)
+            | get_llm(str(api_key).strip())
+        )
+        decision = chain.invoke({
+            "question": (text or "").strip(),
+            "conversation_context": conversation_context or "(none)",
+            "response_language": response_language or "en",
+        })
+        content = getattr(decision, "content", decision)
+        return str(content).strip() or None
+    except Exception:
+        return None
 
 
 _PAGE_MARKERS = (
@@ -177,6 +351,14 @@ _REPEAT_PATTERNS = (
 _CLARIFY_PATTERNS = (
     r"^(what do you mean|which one|can you clarify|i don't understand)[!.? ]*$",
     r"(आपका मतलब क्या है|ನಿಮ್ಮ ಅರ್ಥವೇನು|நீங்கள் என்ன சொல்கிறீர்கள்|మీ ఉద్దేశం ఏమిటి)",
+)
+_WAIT_PATTERNS = (
+    r"\b(wait|hold on|one moment|give me a second|take your time)\b",
+    r"रुकिए|एक मिनट|समय लीजिए|ತಡೆಯಿರಿ|ಒಂದು ಕ್ಷಣ|காத்திருங்கள்|ஒரு நிமிடம்|ఆగండి|ఒక్క నిమిషం",
+)
+_READY_PATTERNS = (
+    r"\b(i am ready|i'm ready|ready now|you can continue)\b",
+    r"मैं तैयार हूँ|ನಾನು ಸಿದ್ಧ|நான் தயாராக இருக்கிறேன்|నేను సిద్ధంగా ఉన్నాను",
 )
 
 
@@ -233,10 +415,26 @@ def classify_intent(
         return non_rag(IntentType.REPEAT_RESPONSE, 0.98, "REPEAT_LAST_RESPONSE")
     if _matches(_CLARIFY_PATTERNS, normalized):
         return non_rag(IntentType.CLARIFY_RESPONSE, 0.91, "REQUEST_CLARIFICATION")
+    if _matches(_WAIT_PATTERNS, normalized):
+        return IntentClassification(
+            IntentType.WAIT_FOR_USER, 0.96, requires_retrieval=False,
+            retrieval_strategy="NONE", requires_evaluation=False,
+            response_action="PAUSE_RESPONSE", response_language=response_language,
+            conversation_action="WAIT",
+        )
+    if _matches(_READY_PATTERNS, normalized):
+        return IntentClassification(
+            IntentType.READY_TO_CONTINUE, 0.96, requires_retrieval=False,
+            retrieval_strategy="NONE", requires_evaluation=False,
+            response_action="RESUME_LISTENING", response_language=response_language,
+            conversation_action="RESUME",
+        )
 
     voice_intent = classify_voice_intent(normalized)
     if voice_intent == "greeting":
         return non_rag(IntentType.GREETING, 0.99, "RESPOND_GREETING")
+    if voice_intent == "application_help":
+        return non_rag(IntentType.APPLICATION_HELP, 0.97, "RESPOND_APPLICATION_HELP")
     if voice_intent == "small_talk":
         # Preserve the legacy combined greeting/small-talk label for callers
         # that use it, while exposing the richer casual label for simple talk.
@@ -245,8 +443,6 @@ def classify_intent(
             IntentType.GENERAL_CONVERSATION if legacy else IntentType.CASUAL_CONVERSATION,
             0.98, "RESPOND_CASUALLY",
         )
-    if voice_intent == "application_help":
-        return non_rag(IntentType.APPLICATION_HELP, 0.97, "RESPOND_APPLICATION_HELP")
     if voice_intent == "out_of_scope":
         return non_rag(IntentType.OUT_OF_SCOPE, 0.96, "RESPOND_OUT_OF_SCOPE")
 
@@ -280,10 +476,10 @@ def classify_voice_intent(text: str) -> str:
     normalized = re.sub(r"\s+", " ", (text or "").strip().lower())
     if any(re.search(pattern, normalized, flags=re.IGNORECASE) for pattern in GREETING_PATTERNS):
         return "greeting"
-    if any(re.search(pattern, normalized, flags=re.IGNORECASE) for pattern in SMALL_TALK_PATTERNS):
-        return "small_talk"
     if any(re.search(pattern, normalized, flags=re.IGNORECASE) for pattern in APPLICATION_HELP_PATTERNS):
         return "application_help"
+    if any(re.search(pattern, normalized, flags=re.IGNORECASE) for pattern in SMALL_TALK_PATTERNS):
+        return "small_talk"
     if any(re.search(pattern, normalized, flags=re.IGNORECASE) for pattern in OUT_OF_SCOPE_PATTERNS):
         return "out_of_scope"
     # Unknown factual requests remain document-bound by default.

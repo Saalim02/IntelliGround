@@ -4,6 +4,7 @@ import fcntl
 import logging
 import shutil
 import tempfile
+from contextlib import contextmanager
 from functools import lru_cache
 from pathlib import Path
 
@@ -12,7 +13,10 @@ from langchain_community.vectorstores import FAISS
 
 from app.services.embedding_service import (
     get_embedding_model,
+    EMBEDDING_PROVIDER,
     EMBEDDING_MODEL_NAME,
+    EMBEDDING_MODEL_VERSION,
+    EMBEDDING_DIMENSIONS,
     DOCUMENT_PROMPT,
     QUERY_PROMPT,
     NORMALIZE_EMBEDDINGS,
@@ -26,6 +30,7 @@ from app.services.bm25_service import (
     load_sparse_index,
     save_sparse_index,
 )
+from app.services.document_registry_service import get_active_document
 
 
 logger = logging.getLogger(__name__)
@@ -46,7 +51,10 @@ def _get_embedding_manifest() -> dict:
 
     return {
         "schema_version": 1,
+        "provider": EMBEDDING_PROVIDER,
         "model_name": EMBEDDING_MODEL_NAME,
+        "model_version": EMBEDDING_MODEL_VERSION,
+        "dimensions": EMBEDDING_DIMENSIONS,
         "document_prompt": DOCUMENT_PROMPT,
         "query_prompt": QUERY_PROMPT,
         "normalize_embeddings": NORMALIZE_EMBEDDINGS,
@@ -170,6 +178,20 @@ def _get_vectorstore_dir(
         return VECTORSTORE_DIR
 
     return get_user_vectorstore_dir(user_id)
+
+
+@contextmanager
+def vectorstore_read_lock(user_id: int | None = None):
+    """Prevent reads from interleaving with transactional index replacement."""
+    vectorstore_dir = _get_vectorstore_dir(user_id)
+    vectorstore_dir.parent.mkdir(parents=True, exist_ok=True)
+    lock_file = vectorstore_dir.parent / ".vectorstore.lock"
+    with lock_file.open("a+") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_SH)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 # --------------------------------------------------
@@ -353,28 +375,38 @@ def load_vectorstore(
 
     vectorstore_dir = _get_vectorstore_dir(user_id)
 
-    if not vectorstore_dir.exists():
-        return None
+    with vectorstore_read_lock(user_id):
+        if not vectorstore_dir.exists() or not _has_compatible_embedding_manifest(vectorstore_dir):
+            return None
+        try:
+            files = [
+                vectorstore_dir / "index.faiss",
+                vectorstore_dir / "index.pkl",
+                vectorstore_dir / EMBEDDING_MANIFEST_FILENAME,
+                vectorstore_dir / SPARSE_INDEX_FILENAME,
+            ]
+            stats = tuple(
+                (path.stat().st_ino, path.stat().st_mtime_ns, path.stat().st_size)
+                for path in files
+            )
+            active = get_active_document(user_id) if user_id is not None else None
+            document_id = (active or {}).get("active_doc_id")
+            return _load_vectorstore_cached(
+                user_id, document_id, stats, str(vectorstore_dir),
+            )
+        except Exception:
+            return None
 
-    # Validate embedding compatibility before loading.
-    if not _has_compatible_embedding_manifest(
-        vectorstore_dir
-    ):
-        return None
 
-    embeddings = get_embedding_model()
-
-    try:
-        vectorstore = FAISS.load_local(
-            str(vectorstore_dir),
-            embeddings,
-            allow_dangerous_deserialization=True,
-        )
-
-        return vectorstore
-
-    except Exception:
-        return None
+@lru_cache(maxsize=128)
+def _load_vectorstore_cached(user_id: int | None, document_id: str | None, index_version: tuple, directory: str):
+    """Reuse an immutable, explicitly user/document/version-scoped index."""
+    del user_id, document_id, index_version
+    return FAISS.load_local(
+        directory,
+        get_embedding_model(),
+        allow_dangerous_deserialization=True,
+    )
 
 
 def load_sparse_vectorstore(user_id: int | None = None):

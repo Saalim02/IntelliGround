@@ -493,6 +493,27 @@ def test_language_and_summary_endpoints_are_authenticated_and_contractual(monkey
         app.dependency_overrides.pop(get_current_user, None)
 
 
+def test_current_document_endpoint_returns_persisted_language_metadata(monkeypatch):
+    user = User(id=42, email="current@example.com", is_active=True)
+    app.dependency_overrides[get_current_user] = lambda: user
+    monkeypatch.setattr(
+        "app.api.routes.document_intelligence.get_active_document",
+        lambda user_id: {
+            "active_doc_id": "doc-a",
+            "active_filename": "source.pdf",
+            "evidence_language": "kn",
+            "response_language": "en",
+        } if user_id == 42 else None,
+    )
+    try:
+        response = TestClient(app).get("/api/document/current")
+        assert response.status_code == 200
+        assert response.json()["document"]["evidence_language"] == "kn"
+        assert response.json()["document"]["response_language"] == "en"
+    finally:
+        app.dependency_overrides.pop(get_current_user, None)
+
+
 def test_evidence_loader_isolated_to_active_user_document(monkeypatch):
     records = [
         SimpleNamespace(metadata=_chunk(doc_id="doc-a", chunk_id=1), text="A"),
