@@ -1,520 +1,466 @@
 # IntelliGround
 
-IntelliGround is an AI-powered multilingual documentation assistant. Users upload PDF documents and ask questions about them in text or voice. The application retrieves relevant passages from the user's active document, generates grounded answers, and returns page-level evidence and visual page previews.
+### Evidence-grounded multilingual PDF intelligence for text and voice
 
-Instead of manually reading hundreds of pages, users can request summaries, important topics, suggested questions, page explanations, and contextual follow-ups. The voice agent distinguishes normal conversation from PDF questions.
+IntelliGround is a React and FastAPI application for asking questions about uploaded PDF documents. It extracts page-aware evidence, indexes each user's active document with dense and sparse retrieval, generates answers in a selected response language, and exposes citations back to source-page and paragraph metadata.
 
-> This README documents the implementation currently present in the repository. Optional and partially integrated features are identified explicitly.
+The application also includes document summaries, key topics, suggested questions, persisted conversations, answer evaluation, guardrails, and an optional Gnani Prisma/Timbre voice interface.
 
-## Why IntelliGround exists
+> This README describes the implementation currently present in this repository. Provider credentials, model downloads, OCR availability, browser permissions, and deployment configuration require environment-specific verification.
 
-Long PDFs are difficult to search when information is spread across pages, tables, or scanned images. Keyword search misses meaning, while an unconstrained LLM can produce plausible but unsupported answers. Language differences make document understanding harder, and users need traceable evidence.
+## Contents
 
-IntelliGround addresses these problems with page-aware extraction, OCR fallback, multilingual embeddings, BM25 keyword retrieval, hybrid ranking, evidence citations, authenticated user-scoped storage, multilingual responses, and voice interaction.
+- [What it provides](#what-it-provides)
+- [Feature status](#feature-status)
+- [Architecture](#architecture)
+- [Technology stack](#technology-stack)
+- [Repository layout](#repository-layout)
+- [Local setup](#local-setup)
+- [Environment variables](#environment-variables)
+- [API overview](#api-overview)
+- [RAG pipeline](#rag-pipeline)
+- [Voice agent](#voice-agent)
+- [Testing and validation](#testing-and-validation)
+- [Deployment](#deployment)
+- [Security](#security)
+- [Limitations and roadmap](#limitations-and-roadmap)
+- [Contributing and license](#contributing-and-license)
+- [Contact](#contact)
 
-## Key features
+## What it provides
 
-### PDF upload and processing
+IntelliGround is designed for long, multilingual and occasionally scanned PDFs where keyword search alone is insufficient and unsupported LLM answers are unacceptable. Its differentiators are:
 
-- PDF-only validation.
-- Maximum configured file size: 200 MB.
-- Maximum configured page count: 1,400 pages.
-- Native PyMuPDF extraction.
-- Tesseract OCR fallback for blank or corrupted pages.
-- OCR language selection and extraction-method metadata.
-- Adaptive page-aware chunking with overlap.
-- Page image generation for evidence previews.
-- Upload progress jobs.
-- Atomic vector-store and active-document registry updates.
-- Per-user active-document isolation.
+- page- and chunk-preserving document processing;
+- dense, BM25 and hybrid retrieval with Reciprocal Rank Fusion (RRF);
+- optional cross-encoder reranking with explicit disabled/failed states;
+- document-scoped answer generation with evidence and citation metadata;
+- separate text-language, query-language, response-language and provider-language handling;
+- user-scoped documents, conversations, evaluations and page previews;
+- a shared orchestration path for typed questions and eligible voice turns.
 
-### Document intelligence
+Typical uses include policy and legal-document exploration, multilingual study material, internal reports, scanned records, evidence-backed document Q&A, and hands-free document interaction.
 
-The React client exposes on-demand document actions:
+## Feature status
 
-- grounded summaries;
-- key topics and important points;
-- suggested questions;
-- response-language selection.
+| Area | Status | Implementation notes |
+|---|---|---|
+| PDF upload and validation | Implemented | PDF checks, size/page limits, upload progress and per-user active-document tracking. |
+| Native extraction and OCR | Implemented | PyMuPDF extraction with Tesseract/PyTesseract fallback and configurable OCR languages. |
+| Multilingual processing | Implemented with provider limits | Text registry includes English, Kannada, Hindi, Tamil, Telugu, Malayalam, Marathi, Gujarati, Bengali, Punjabi and Urdu. |
+| Dense retrieval | Implemented | intfloat/multilingual-e5-small embeddings and FAISS indexes. |
+| Sparse retrieval | Implemented | Persistent BM25 using rank-bm25, with an internal fallback. |
+| Hybrid retrieval and RRF | Implemented | Dense and sparse candidates are fused using Reciprocal Rank Fusion. |
+| Reranking | Optional | Cross-encoder reranking is disabled by default and depends on local model availability. |
+| Grounded answers and citations | Implemented | Active-document evidence returns page/chunk/paragraph metadata where available. |
+| Summaries, topics and questions | Implemented | On-demand document intelligence uses the same evidence boundary. |
+| LLM providers | Implemented/configuration-dependent | OpenAI is supported; an Evon adapter exists for an explicitly configured compatible endpoint. |
+| Provider fallback | Implemented | Retryable primary-provider failures can use a separately configured fallback. |
+| Voice STT/TTS | Implemented/configuration-dependent | Gnani Prisma STT and Timbre TTS adapters support REST and WebSocket paths. |
+| Voice streaming | Implemented in application code | Browser PCM capture, FastAPI WebSocket sessions, interruption handling and streamed playback. |
+| Emotion-aware behavior | Implemented as response state | Emotion affects delivery guidance and UI state. A generic Timbre emotion field is not claimed or sent. |
+| Voice selection | Implemented | Voice catalogue and preference routes expose the configured Timbre v2.5 catalogue. |
+| Conversation persistence | Implemented | Conversations, turns, document metadata, response language and length are persisted. |
+| Evaluation and guardrails | Implemented with dependencies | Retrieval, grounding, source relevance, correctness, citation, confidence, human review and guardrails are present. |
+| LangSmith | Partial foundation | Metadata-only tracing utilities and controls exist, but they are not wired into every normal RAG request. |
 
-These operations read authenticated document evidence, validate references against real chunk identifiers, and validate language and citation consistency. They are generated on demand rather than being claimed as automatic upload-time outputs.
+Urdu is supported by the text-language registry and text response validation. It is deliberately excluded from the current verified Gnani voice-language allow-list until provider support is confirmed; the voice path fails explicitly rather than silently substituting English.
 
-### Retrieval and grounded answers
+## Architecture
 
-- Dense semantic retrieval with intfloat/multilingual-e5-small.
-- FAISS vector storage.
-- Persistent BM25 sparse retrieval using rank-bm25, with an internal fallback.
-- Hybrid dense and sparse retrieval.
-- Reciprocal Rank Fusion.
-- Optional multilingual cross-encoder reranking.
-- Dynamic candidate sizing based on document size.
-- Exact page retrieval for requests such as “Explain page 40.”
-- Page, chunk, paragraph, source, snippet, and image metadata where available.
-- Grounded fallback when evidence is insufficient.
-- Reranking diagnostics in query responses.
-
-### Conversation and voice
-
-The intent layer recognizes greetings, audio checks, casual conversation, acknowledgments, continuation, repetition, clarification, page queries, document overviews, document questions, contextual follow-ups, application help, out-of-scope requests, and ambiguous references.
-
-Non-document messages do not invoke RAG or LLM-as-a-Judge evaluation. Recent user-scoped context is used for follow-ups, while continuation and repetition avoid duplicate retrievals and evaluations.
-
-Voice uses Gnani Prisma speech-to-text, Gnani Timbre text-to-speech, buffered voice turns, a WebSocket streaming route, interruption handling, and the same shared query orchestration used by typed questions.
-
-### Evaluation and trust
-
-Eligible document answers can be evaluated with the existing LLM-as-a-Judge service. It measures retrieval quality, source relevance, grounding, claim support, answer correctness, citation quality, overall confidence, and decision status.
-
-Greetings, audio checks, casual conversation, acknowledgments, continuation, repetition, clarification, out-of-scope refusals, and evidence-free answers are excluded from evaluation. Existing ownership, eligibility, rate-limit, and duplicate-evaluation checks remain active.
-
-The project includes input guardrails, semantic guardrails, document prompt-injection inspection, output guardrails, safe fallbacks, protected human review, Developer Settings, and audit logging.
-
-LangSmith configuration and a metadata-only service foundation are present. Sensitive metadata such as questions, answers, prompts, PDF text, audio, passwords, and API keys is rejected. The service is not yet wired into every normal RAG request, so configuration alone does not prove that every request is traced.
-
-## How IntelliGround works
-
-### PDF ingestion pipeline
-
-~~~text
-PDF upload
-    ↓
-File, MIME, size, page-count, and OCR-language validation
-    ↓
-Native extraction with OCR fallback
-    ↓
-Page-aware adaptive chunking
-    ↓
-Document/page/chunk/paragraph/offset/language metadata
-    ↓
-Multilingual E5 embeddings and FAISS index
-    ↓
-Persistent BM25 index
-    ↓
-Page images, summary source, and user-scoped active registry
-    ↓
-Document ready
-~~~
-
-Extraction preserves page boundaries and records whether content came from native extraction, OCR, or a blank page. Chunk metadata is carried into both indexes so answers can cite the original page and chunk.
-
-### Question-answering pipeline
-
-~~~text
-User text or voice transcript
-    ↓
-Input guardrail and language detection
-    ↓
-Intent classification and conversation-context resolution
-    ↓
-Direct page retrieval or hybrid retrieval
-    ↓
-Dense FAISS candidates plus BM25 candidates
-    ↓
-Reciprocal Rank Fusion
-    ↓
-Optional cross-encoder reranking
-    ↓
-Evidence and citation construction
-    ↓
-Grounded LLM answer generation
-    ↓
-Output and response-language validation
-    ↓
-Eligible-answer evaluation and persistence
-    ↓
-Answer, evidence, page preview, confidence, and evaluation status
-~~~
-
-Dense retrieval finds passages with similar meaning. BM25 contributes exact words, names, numbers, and terminology. RRF combines their rankings without assuming either method is always correct. The optional reranker scores fused candidates and reports an explicit disabled or failed status when unavailable.
-
-Page questions use the page retrieval service instead of silently substituting a different page. It reads authenticated user records, preserves page and chunk order, and can use authorized OCR fallback when stored text is unavailable. Invalid or empty pages return a truthful message rather than fabricated evidence.
-
-## Intelligent voice agent
-
-Each authenticated voice turn is transcribed, language-checked, classified, passed to shared query orchestration when appropriate, persisted, and synthesized back to speech.
-
-~~~text
-User: Hello, how are you?
-Assistant: I'm doing well. What would you like to know about your PDF?
-
-User: Explain page 40.
-Assistant: Retrieves page 40, explains supported content, and returns page evidence.
-
-User: Continue speaking.
-Assistant: Continues without starting a duplicate document query.
-
-User: Can you hear me?
-Assistant: Yes, I can hear you clearly.
-~~~
-
-A greeting is not a PDF question. Sending it through retrieval could produce an incorrect “not found in PDF” response and an unnecessary evaluation record. A later document question still uses the active document and recent conversation context.
-
-The frontend supports microphone capture, PCM audio worklet processing, WebSocket voice sessions, mute/output controls, speaking/listening states, and interruption handling. It uses the configured Gnani integrations rather than claiming provider-independent streaming.
-
-## Multilingual architecture
-
-| Concept | Meaning |
-|---|---|
-| PDF/evidence language | Language detected or recorded for extracted page content. |
-| Query language | Language detected from the current typed question or transcript. |
-| Response language | Language selected by the user and passed explicitly to generation. |
-| STT language | Provider language used or detected for speech recognition. |
-| TTS language | Verified provider mapping used for speech synthesis. |
-
-The broader language registry includes English, Kannada, Tamil, Telugu, Hindi, Malayalam, Marathi, Gujarati, Bengali, Punjabi, and Urdu. Gnani mappings are separately validated, so not every text language should be assumed to support voice output. Original evidence is preserved rather than translated merely to simplify retrieval.
-
-## Evaluation and security architecture
-
-The evaluator combines deterministic and optional LLM-assisted checks. Retrieved document content is treated as untrusted data: instructions found inside a PDF are never promoted to system or developer instructions.
-
-Human review is available through protected evaluation-review endpoints and Developer Settings. The user-facing evaluation drawer can evaluate eligible stored answers and save helpful/not-helpful feedback. The developer dashboard exposes evaluation counts, pending reviews, guardrail testing, and observability configuration.
-
-## System architecture
+The React/Vite client communicates with FastAPI over HTTP and WebSocket. Uploaded PDFs are stored under user-scoped paths. Extracted pages are chunked, embedded and indexed in dense and sparse stores. Query and voice orchestration resolve intent and context before retrieval. Only eligible document questions proceed through evidence construction and grounded generation.
 
 ~~~mermaid
 flowchart LR
-    U[User] --> FE[React TypeScript Vite]
-    FE --> AUTH[FastAPI authentication]
-    FE --> UP[Upload routes]
-    FE --> Q[Query routes]
-    FE --> V[Voice routes]
-    FE --> DI[Document intelligence]
-    FE --> DEV[Developer Settings]
+    User[User] --> React[React + TypeScript + Vite]
+    React --> HTTP[FastAPI HTTP API]
+    React --> WS[FastAPI Voice WebSocket]
 
-    UP --> PDF[PyMuPDF extraction]
-    PDF --> OCR[Tesseract OCR fallback]
-    PDF --> CH[Adaptive page-aware chunks]
-    CH --> EMB[Multilingual E5 embeddings]
-    EMB --> FAISS[FAISS vector index]
-    CH --> BM25[BM25 sparse index]
-    PDF --> IMG[Page images]
-    PDF --> REG[User-scoped document registry]
+    HTTP --> Auth[Authentication and ownership]
+    HTTP --> Upload[PDF upload]
+    Upload --> Extract[PyMuPDF extraction]
+    Extract --> OCR[Tesseract fallback]
+    Extract --> Chunk[Page-aware chunks and metadata]
+    Chunk --> Embed[Multilingual E5 embeddings]
+    Embed --> FAISS[FAISS index]
+    Chunk --> BM25[BM25 index]
+    Extract --> Images[Page images]
 
-    Q --> ORCH[Shared RAG orchestration]
-    V --> INTENT[Intent and context resolution]
-    INTENT --> ORCH
-    ORCH --> DENSE[Dense retrieval]
-    ORCH --> SPARSE[Sparse retrieval]
-    DENSE --> RRF[Reciprocal Rank Fusion]
-    SPARSE --> RRF
-    RRF --> RR[Optional reranker]
-    RR --> EVID[Evidence and citations]
-    EVID --> LLM[Grounded LLM generation]
-    LLM --> EVAL[Evaluation services]
-    EVAL --> REVIEW[Human review]
+    HTTP --> Query[Query orchestration]
+    WS --> Prisma[Gnani Prisma STT]
+    Prisma --> Query
+    Query --> Intent[Intent and context resolution]
+    Intent --> Retrieve[Active-document retrieval]
+    Retrieve --> Dense[Dense candidates]
+    Retrieve --> Sparse[Sparse candidates]
+    Dense --> RRF[RRF fusion]
+    Sparse --> RRF
+    RRF --> Rerank[Optional cross-encoder]
+    Rerank --> Evidence[Evidence and citations]
+    Evidence --> LLM[OpenAI or configured Evon LLM]
+    LLM --> Validate[Language, output and guardrails]
+    Validate --> Persist[Conversation and evaluation storage]
+    Validate --> React
+    Validate --> Timbre[Gnani Timbre TTS]
+    Timbre --> React
 
-    V --> STT[Gnani Prisma STT]
-    V --> TTS[Gnani Timbre TTS]
-    AUTH --> DB[(SQLite by default)]
-    ORCH --> DB
-    EVAL --> STORE[(Persistent user storage)]
-    FE -. isolated foundation .-> LS[LangSmith]
+    Auth --> DB[(SQLite by default)]
+    Persist --> DB
 ~~~
 
 ## Technology stack
 
-| Technology | Purpose | Location |
-|---|---|---|
-| Python 3.11 | Backend runtime and image base | Dockerfile.backend |
-| FastAPI | HTTP and WebSocket API | app/main.py and app/api/routes |
-| Uvicorn | ASGI server | Dockerfile.backend |
-| React 19 and TypeScript | Single-page application | frontend/intelliground-web/src |
-| Vite | Frontend development and build | frontend/intelliground-web/package.json |
-| PyMuPDF | PDF extraction and page access | app/services/pdf_service.py |
-| Tesseract and pytesseract | OCR fallback | app/services/pdf_service.py |
-| LangChain | LLM and embedding integration | requirements.backend.txt |
-| OpenAI-compatible LLM | Answers, intelligence, and judge calls | app/services/llm_service.py |
-| intfloat/multilingual-e5-small | Multilingual embeddings | app/services/embedding_service.py |
-| FAISS | Dense vector index | app/services/vector_store_service.py |
-| rank-bm25 | Sparse retrieval | app/services/bm25_service.py |
-| Reciprocal Rank Fusion | Dense/sparse fusion | app/services/rrf_service.py |
-| sentence-transformers | Optional cross-encoder reranking | app/services/reranker_service.py |
-| SQLAlchemy and SQLite | Auth and conversation persistence | app/core/database.py |
-| PyJWT, pwdlib, Authlib | Sessions, hashing, OAuth | app/services/security and auth routes |
-| Gnani Prisma | Speech-to-text | app/services/gnani_prisma_service.py |
-| Gnani Timbre | Text-to-speech | app/services/gnani_timbre_service.py |
-| LangSmith SDK | Metadata-only observability foundation | app/services/observability |
-| pytest | Backend tests | tests |
+| Category | Technologies confirmed in the repository |
+|---|---|
+| Frontend | React 19, TypeScript, Vite 8, React DOM, Oxlint |
+| Backend | Python 3.11 container target, FastAPI, Uvicorn, Pydantic, python-multipart |
+| LLM | LangChain, langchain-openai, OpenAI adapter, Evon adapter and retryable fallback gateway |
+| Embeddings | Hugging Face intfloat/multilingual-e5-small, langchain-huggingface |
+| Retrieval | FAISS, rank-bm25, NumPy, RRF, optional sentence-transformers cross-encoder |
+| PDF/OCR | PyMuPDF, Tesseract, PyTesseract, Pillow |
+| Speech | Gnani Prisma STT, Gnani Timbre TTS, websockets, browser AudioWorklet/PCM capture |
+| Persistence | SQLAlchemy, SQLite by default, filesystem storage |
+| Authentication | PyJWT, pwdlib[argon2], Authlib, cryptography |
+| Operations | Dockerfile, Docker Compose backend service, environment configuration and logging |
+| Testing/observability | pytest, LangSmith SDK foundation, evaluation and benchmark utilities |
 
-## Project structure
+## Repository layout
 
 ~~~text
 .
 ├── app/
-│   ├── api/routes/              FastAPI auth, upload, query, voice, intelligence, developer APIs
-│   ├── core/                    Configuration, database, logging
-│   ├── models/                  Pydantic and SQLAlchemy models
-│   ├── services/                PDF, retrieval, RAG, voice, evaluation, security
-│   ├── utils/                   File handling, metadata, debug export
-│   └── main.py                  FastAPI application and middleware
+│   ├── api/routes/          FastAPI auth, upload, query, document, voice and developer routes
+│   ├── core/                Configuration, database and logging
+│   ├── models/              Pydantic and SQLAlchemy models
+│   ├── services/
+│   │   ├── llm/             OpenAI/Evon adapters and fallback gateway
+│   │   ├── observability/   Metadata-only LangSmith foundation
+│   │   ├── security/        Authentication, authorization and guardrails
+│   │   └── evaluation/      Retrieval, grounding, citation and confidence evaluation
+│   ├── utils/               File, metadata and debug helpers
+│   └── main.py              FastAPI app, middleware and route registration
 ├── frontend/intelliground-web/
-│   ├── src/App.tsx              Main workspace, upload, chat, evidence, evaluation
-│   ├── src/VoiceAgent.tsx       WebSocket voice UI and audio controls
-│   ├── src/EvaluationDrawer.tsx User-facing answer evaluation drawer
-│   ├── src/App.css              Application styling
-│   └── package.json              Vite scripts and dependencies
-├── storage/                    Uploads, indexes, page images, summaries, evaluations, database
-├── logs/                       Application logs
-├── tests/                      Backend unit and integration tests
-├── benchmarks/                 Retrieval, reranker, OCR, and multilingual utilities
-├── Dockerfile.backend           Backend image
-├── docker-compose.yml           Backend Compose service and persistent mounts
-├── requirements.backend.txt     Backend dependencies
+│   ├── src/App.tsx          Text workspace, upload, conversation and evaluation UI
+│   ├── src/VoiceAgent.tsx   Voice UI, AudioWorklet capture and WebSocket lifecycle
+│   ├── src/EvaluationDrawer.tsx
+│   ├── src/App.css
+│   └── package.json
+├── benchmarks/              Retrieval, reranker, OCR and multilingual utilities
+├── tests/                   Backend unit/integration and benchmark tests
+├── storage/                 Runtime uploads, indexes, images, summaries and database
+├── logs/                    Runtime logs
+├── Dockerfile.backend
+├── docker-compose.yml       Backend-only Compose service
+├── requirements.backend.txt
+├── requirements.txt
+├── pytest.ini
 └── README.md
 ~~~
 
-Legacy and backup artifacts are intentionally omitted from this simplified tree.
+Runtime directories are created by the application and should not be treated as source-controlled data.
 
-## Installation and setup
+## Local setup
 
 ### Prerequisites
 
-- Python 3.11 or compatible.
+- Python 3.11 or a compatible Python environment.
 - Node.js and npm compatible with the Vite toolchain.
 - Tesseract OCR and required language packs for local non-Docker OCR.
-- An OpenAI-compatible API key.
+- An OpenAI API key for the default LLM path.
 - Optional Gnani credentials for voice features.
 - Optional Docker Engine and Docker Compose for the backend container.
 
-### Install
+### Clone and install
 
 ~~~bash
-git clone <repository-url>
-cd IntelliGroud-
+git clone https://github.com/Saalim02/IntelliGround.git
+cd IntelliGround
 
 python3.11 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.backend.txt
+python -m pip install -r requirements.backend.txt
 
 cd frontend/intelliground-web
 npm install
 cd ../..
 ~~~
 
-Frontend scripts are npm run dev, npm run build, and npm run preview.
+The repository does not contain a checked-in .env.example; create .env locally from the variable list below. Never commit real credentials.
 
-### Configure the environment
+### Configure and run
 
-Create a local .env in the project root. Never commit real credentials:
-
-~~~dotenv
-OPENAI_API_KEY=<provider-key>
-RAG_ACCESS_PASSWORD=<rag-access-password>
-JWT_SECRET_KEY=<long-random-secret>
-FRONTEND_URL=http://localhost:5175
-VITE_API_BASE_URL=http://localhost:8000/api
-~~~
-
-A checked-in .env.example was not present during inspection. Use placeholders and keep the real .env local.
-
-### Run locally
-
-Backend:
+The backend validates OPENAI_API_KEY, RAG_ACCESS_PASSWORD and JWT_SECRET_KEY at startup.
 
 ~~~bash
+# Terminal 1, from the repository root
 source .venv/bin/activate
 uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
-~~~
 
-Frontend in a second terminal:
-
-~~~bash
+# Terminal 2
 cd frontend/intelliground-web
-npm run dev -- --host 0.0.0.0 --port 5175
+npm run dev -- --host 0.0.0.0 --port 5173
 ~~~
 
-URLs:
+Open http://localhost:5173. The API is available at http://localhost:8000, with health at /health, OpenAPI at /docs, and ReDoc at /redoc.
 
-- UI: http://localhost:5175
-- Health: http://localhost:8000/health
-- API docs: http://localhost:8000/docs
-- ReDoc: http://localhost:8000/redoc
+### Docker Compose
 
-### Docker backend
-
-The current Compose file defines only a backend service:
+The checked-in Compose file defines a backend-only service. It loads .env, exposes port 8000, and mounts ./storage and ./logs.
 
 ~~~bash
-docker compose build backend
-docker compose up -d --force-recreate backend
+docker compose up --build backend
 ~~~
 
-It maps 8000:8000, loads .env, and mounts ./storage and ./logs into the container. The frontend is not a Compose service and should be run with Vite unless deployment-specific configuration is added.
+The frontend is not a Compose service and must be run separately with Vite unless deployment-specific packaging is added.
 
 ## Environment variables
 
-### Required backend variables
+Use placeholders in local configuration:
 
-| Variable | Purpose |
+~~~dotenv
+OPENAI_API_KEY=your_openai_api_key_here
+RAG_ACCESS_PASSWORD=your_rag_access_password_here
+JWT_SECRET_KEY=replace_with_a_long_random_secret
+FRONTEND_URL=http://localhost:5173
+VITE_API_BASE_URL=http://localhost:8000/api
+~~~
+
+### Required and core variables
+
+| Variable | Required | Purpose/default |
+|---|---:|---|
+| OPENAI_API_KEY | Yes | Default LLM and authorization path. |
+| RAG_ACCESS_PASSWORD | Yes | Protected RAG authorization. |
+| JWT_SECRET_KEY | Yes | Signs browser access tokens. |
+| FRONTEND_URL | No | Primary allowed frontend origin; backend default is http://localhost:8501. |
+| DATABASE_URL | No | SQLAlchemy URL; defaults to SQLite under storage/app.db. |
+| COOKIE_SECURE | No | Secure-cookie flag; defaults to false. |
+| LOCAL_DEV_AUTH_BYPASS | No | Explicit local development identity; defaults to false. |
+| DEVELOPER_ACCESS_PASSWORD | No | Enables protected developer access. |
+| GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REDIRECT_URI | No | Google OAuth configuration. |
+| EVALUATION_MODEL | No | Evaluation model; defaults to gpt-4o-mini. |
+
+### LLM provider variables
+
+| Variable | Purpose/default |
 |---|---|
-| OPENAI_API_KEY | LLM/provider authorization |
-| RAG_ACCESS_PASSWORD | Protected RAG authorization |
-| JWT_SECRET_KEY | Signs browser access tokens |
+| LLM_PRIMARY_PROVIDER | openai or evon; defaults to openai. |
+| LLM_FALLBACK_PROVIDER | openai or evon; defaults to openai. |
+| OPENAI_MODEL | Defaults to gpt-4o-mini. |
+| EVON_API_KEY, EVON_BASE_URL, EVON_MODEL | Required when Evon is selected; the endpoint is not inferred. |
+| LLM_REQUEST_TIMEOUT_SECONDS | Defaults to 60. |
+| LLM_MAX_RETRIES | Defaults to 1, validated to 0–3. |
 
-### Application and authentication
+### Voice variables
 
-| Variable | Purpose | Default or status |
-|---|---|---|
-| FRONTEND_URL | Primary allowed frontend origin | Backend default is http://localhost:8501; local Vite commonly uses 5175 |
-| COOKIE_SECURE | Secure-cookie behavior | Deployment-specific |
-| DATABASE_URL | SQLAlchemy database URL | SQLite at storage/app.db |
-| LOCAL_DEV_AUTH_BYPASS | Optional local development identity | false |
-| DEVELOPER_ACCESS_PASSWORD | Developer Settings access | Optional, required for that feature |
-| GOOGLE_CLIENT_ID | Google OAuth client ID | Optional |
-| GOOGLE_CLIENT_SECRET | Google OAuth client secret | Optional |
-| GOOGLE_REDIRECT_URI | Google OAuth callback | Optional |
-| EVALUATION_MODEL | Evaluation model | gpt-4o-mini |
-
-### Voice
-
-| Variable | Purpose |
+| Variable | Purpose/default |
 |---|---|
-| GNANI_API_KEY | Gnani authorization; optional until voice is configured |
-| GNANI_STT_MODEL | Prisma model; default prisma-v3.0 |
-| GNANI_TTS_MODEL | Timbre model; default timbre-v2.5 |
-| GNANI_TTS_VOICE | Timbre voice; default Kaveri |
-| GNANI_STT_URL | Buffered STT endpoint |
-| GNANI_TTS_URL | Buffered TTS endpoint |
-| GNANI_STT_WS_URL | Streaming STT WebSocket |
-| GNANI_TTS_WS_URL | Streaming TTS WebSocket |
-| GNANI_REQUEST_TIMEOUT_SECONDS | Provider timeout; default 60 |
-| GNANI_MAX_AUDIO_BYTES | Maximum audio payload; default 15 MiB |
+| GNANI_API_KEY | Gnani authorization; required for live voice calls. |
+| GNANI_STT_MODEL | Defaults to prisma-v3.0. |
+| GNANI_TTS_MODEL | Defaults to timbre-v2.5. |
+| GNANI_TTS_VOICE | Defaults to Kaveri. |
+| GNANI_STT_URL, GNANI_TTS_URL | REST provider endpoints with repository defaults. |
+| GNANI_STT_WS_URL, GNANI_TTS_WS_URL | Provider WebSocket endpoints with repository defaults. |
+| GNANI_REQUEST_TIMEOUT_SECONDS | Defaults to 60. |
+| GNANI_MAX_AUDIO_BYTES | Defaults to 15 MiB. |
 
-### Retrieval, OCR, observability, and frontend
+### Retrieval, OCR and observability variables
 
-| Variable | Purpose |
-|---|---|
-| RERANKER_ENABLED | Enable optional cross-encoder reranking; default false |
-| RERANKER_MODEL | Reranker model; default BAAI/bge-reranker-v2-m3 |
-| RERANKER_MAX_LENGTH | Reranker sequence length; default 512 |
-| RRF_CONSTANT | RRF rank constant; default 60 |
-| RRF_CANDIDATE_LIMIT | Fused candidate limit |
-| FINAL_EVIDENCE_COUNT | Final evidence limit |
-| DENSE_CANDIDATE_COUNT | Dense candidate tuning |
-| SPARSE_CANDIDATE_COUNT | Sparse candidate tuning |
-| PDF_OCR_DEFAULT_LANG | OCR fallback language preference |
-| LANGSMITH_TRACING | Enable isolated LangSmith foundation |
-| LANGSMITH_ENDPOINT | LangSmith API endpoint |
-| LANGSMITH_API_KEY | LangSmith authorization |
-| LANGSMITH_PROJECT | LangSmith project |
-| VITE_API_BASE_URL | Frontend backend base URL; default http://localhost:8000/api |
+DENSE_CANDIDATE_COUNT, SPARSE_CANDIDATE_COUNT, RRF_CONSTANT, RRF_CANDIDATE_LIMIT, RERANKER_CANDIDATE_LIMIT, FINAL_EVIDENCE_COUNT, RERANKER_ENABLED, RERANKER_MODEL, RERANKER_MAX_LENGTH, EMBEDDING_MODEL_VERSION, EMBEDDING_DIMENSIONS and EMBEDDING_BATCH_SIZE tune retrieval and model loading. PDF_OCR_DEFAULT_LANG controls the OCR fallback preference.
 
-Do not place secrets in frontend source files. The frontend uses authenticated browser cookies for API requests.
+LangSmith configuration uses LANGSMITH_TRACING, LANGSMITH_ENDPOINT, LANGSMITH_API_KEY and LANGSMITH_PROJECT. These variables enable the isolated observability foundation; they do not imply that every normal request is automatically traced.
+
+The frontend reads VITE_API_BASE_URL and defaults to http://localhost:8000/api. Do not put backend secrets in Vite variables or frontend source.
 
 ## API overview
 
-All routes below are under /api unless noted otherwise. Protected routes use the authenticated browser session; document and answer operations also enforce ownership and active-document checks where applicable.
+The FastAPI application mounts these routes under /api unless noted. Protected endpoints use the authenticated browser session; document operations also enforce ownership and active-document/RAG authorization where applicable. FastAPI's generated documentation is authoritative at /docs.
 
-| Method | Endpoint | Purpose | Auth |
-|---|---|---|---|
-| GET | /health | Backend health check | No |
-| POST | /api/auth/register | Create account | No |
-| POST | /api/auth/login | Create browser session | No |
-| GET | /api/auth/me | Read current user | Yes |
-| POST | /api/auth/logout | End browser session | Session |
-| GET | /api/auth/google/login | Begin Google OAuth | No |
-| GET | /api/auth/google/callback | Complete OAuth | Callback |
-| POST | /api/upload-pdf | Upload and index PDF | Yes |
-| GET | /api/upload-pdf/{job_id}/progress | Upload progress | Yes |
-| POST | /api/ask | Shared grounded document QA | Yes + RAG authorization |
-| POST | /api/evaluation/answer | Evaluate eligible stored answer | Yes |
-| POST | /api/evaluation/answer/feedback | Save answer feedback | Yes |
-| GET | /api/evaluation/{evaluation_id} | Read owned evaluation | Yes |
-| POST | /api/evaluation/{evaluation_id}/review | Submit human review | Protected |
-| POST | /api/document/language | Change response language | Yes |
-| POST | /api/document/summary | Generate summary | Yes |
-| POST | /api/document/topics | Generate topics/key points | Yes |
-| POST | /api/document/questions | Generate suggested questions | Yes |
-| POST | /api/summary | Legacy summary route | Yes |
-| POST | /api/suggested-questions | Legacy questions route | Yes |
-| GET | /api/page-images/{doc_id}/{page_filename} | Serve owned page image | Ownership checked |
-| POST | /api/voice/onboarding-speech | Onboarding speech | Yes |
-| POST | /api/voice/transcribe | Transcribe audio | Yes |
-| POST | /api/voice/sessions | Create voice session | Yes |
-| GET | /api/voice/conversations | List voice conversations | Yes |
-| DELETE | /api/voice/conversations/{conversation_id} | Delete conversation | Yes |
-| POST | /api/voice/sessions/{conversation_id}/turn | Buffered voice turn | Yes |
-| POST | /api/voice/sessions/{conversation_id}/synthesize | Synthesize session text | Yes |
-| WS | /api/voice/sessions/{conversation_id}/stream | Streaming voice session | Session auth |
-| GET | /api/developer/dashboard | Developer dashboard | Developer access |
-| POST | /api/developer/evaluations/{evaluation_id}/review | Developer review | Developer access |
-| POST | /api/developer/guardrails/test | Guardrail smoke test | Developer access |
+### Health and authentication
 
-FastAPI's interactive schema is available at /docs.
+| Method | Route | Purpose |
+|---|---|---|
+| GET | /health | Health check; public. |
+| POST | /api/auth/register | Create a local account. |
+| POST | /api/auth/login | Create the browser session. |
+| POST | /api/auth/logout | Clear the browser session. |
+| GET | /api/auth/me | Return the current user. |
+| POST | /api/auth/forgot-password | Start password recovery. |
+| POST | /api/auth/reset-password | Complete password recovery. |
+| GET | /api/auth/google/login | Start Google OAuth when configured. |
+| GET | /api/auth/google/callback | Complete Google OAuth. |
+| POST | /api/auth/onboarding/complete | Mark authenticated onboarding complete. |
 
-## Testing
+### Documents, queries and persistence
 
-Backend tests:
+| Method | Route | Purpose |
+|---|---|---|
+| POST | /api/upload-pdf | Validate, store, extract and index a PDF. |
+| GET | /api/upload-pdf/{job_id}/progress | Read upload-job progress. |
+| POST | /api/ask | Run shared grounded document question answering. |
+| GET | /api/document/current | Read the active document. |
+| POST | /api/document/language | Save response language. |
+| POST | /api/document/summary | Generate a grounded summary. |
+| POST | /api/document/topics | Generate grounded topics/key points. |
+| POST | /api/document/questions | Generate grounded suggested questions. |
+| POST | /api/summary | Legacy summary route. |
+| POST | /api/suggested-questions | Legacy suggested-question route. |
+| GET | /api/conversations | List owned conversations. |
+| GET | /api/conversations/{conversation_id} | Restore an owned conversation and document metadata. |
+| PATCH | /api/conversations/{conversation_id} | Update title/language/length preferences. |
+| GET | /api/page-images/{doc_id}/{page_filename} | Serve an owned generated page image. |
+
+### Evaluation and developer operations
+
+| Method | Route | Purpose |
+|---|---|---|
+| GET | /api/evaluation | List the user's evaluations. |
+| POST | /api/evaluation/answer | Evaluate an eligible stored answer. |
+| POST | /api/evaluation/answer/feedback | Save answer feedback. |
+| GET | /api/evaluation/{evaluation_id} | Read an owned evaluation. |
+| POST | /api/evaluation/{evaluation_id}/review | Submit a protected human review. |
+| GET | /api/developer/dashboard | Developer evaluation dashboard. |
+| GET/PUT | /api/developer/evaluation-config | Read/update evaluation settings. |
+| GET/PUT | /api/developer/emotion-settings | Read/update response-emotion settings. |
+| GET | /api/developer/observability | Read observability status and metrics. |
+| GET | /api/developer/observability/traces | Read retained trace metadata. |
+| GET | /api/developer/providers | Read provider status without secrets. |
+| POST | /api/developer/guardrails/test | Run a protected guardrail test. |
+
+Developer routes require developer access, not merely an ordinary user session.
+
+### Voice
+
+| Method | Route | Purpose |
+|---|---|---|
+| GET | /api/voice/voices | List the application voice catalogue. |
+| POST | /api/voice/voices/preview | Preview a validated voice/language pair. |
+| GET/PUT | /api/voice/preferences | Read/save voice and response-emotion preferences. |
+| POST | /api/voice/transcribe | Transcribe uploaded audio with Prisma. |
+| POST | /api/voice/onboarding-speech | Synthesize onboarding speech. |
+| POST | /api/voice/sessions | Create a persisted voice conversation. |
+| GET | /api/voice/conversations | List owned voice conversations. |
+| DELETE | /api/voice/conversations/{conversation_id} | Delete an owned voice conversation. |
+| POST | /api/voice/sessions/{conversation_id}/turn | Process one buffered audio turn. |
+| POST | /api/voice/sessions/{conversation_id}/synthesize | Synthesize session text. |
+| POST | /api/voice/synthesize-answer | Synthesize an already-generated answer. |
+| WS | /api/voice/sessions/{conversation_id}/stream | Authenticate and stream a voice session. |
+
+## RAG pipeline
+
+1. **Upload:** validate PDF type, size and page-count limits; save under the authenticated user's storage and create upload progress.
+2. **Extraction:** PyMuPDF extracts page text; unusable pages can use Tesseract OCR. Metadata records page, language and extraction method.
+3. **Chunking:** adaptive page-aware chunks preserve document, page, paragraph and character-offset metadata.
+4. **Embeddings:** intfloat/multilingual-e5-small creates normalized 384-dimensional embeddings with passage and query prompts.
+5. **Indexing:** FAISS stores dense vectors; a JSON-persisted BM25 index stores Unicode-tokenized sparse records.
+6. **Retrieval:** the active document is enforced before candidates are accepted. Dense and sparse searches use configurable limits.
+7. **Fusion:** RRF merges candidates by stable document/chunk identity.
+8. **Reranking:** an optional cross-encoder reranks fused candidates; disabled/failed states are explicit.
+9. **Context:** selected chunks become bounded evidence with page, citation, source, snippet and image metadata.
+10. **Generation:** the LLM gateway generates from authorized document context for document intents. Non-RAG intents do not bypass the document policy.
+11. **Validation:** output language, citation consistency, evidence and output guardrails are checked.
+12. **Persistence/evaluation:** eligible answers, turns and evaluation results are stored under the authenticated user.
+
+Page-specific requests use the page retrieval service rather than silently substituting a different page. Selected response language is separate from detected document/query language, and Urdu remains text-supported but not currently voice-verified.
+
+## Voice agent
+
+The voice path is:
+
+1. The browser requests microphone access and captures mono audio through an AudioWorklet.
+2. PCM frames are sent over the authenticated FastAPI WebSocket session.
+3. Prisma STT transcribes the turn and reports provider language metadata when available.
+4. Voice intent and recent context determine whether shared RAG orchestration is needed.
+5. Grounded answers are persisted and streamed through the voice session.
+6. Timbre TTS produces buffered or streamed audio, which the browser schedules for playback.
+7. Interruption handling can stop playback and resume listening; cleanup closes audio contexts, stops media tracks, clears timers and closes sockets.
+
+Response-emotion states such as HAPPY, CALM and PROFESSIONAL affect response delivery and UI behavior. The application does **not** claim that Timbre receives a generic emotion parameter or produces verified emotional audio. Provider-level expressive behavior depends on the configured account and documented provider contract.
+
+Unit and route tests cover voice orchestration, context preservation, provider payloads and cancellation. Browser microphone permissions, AudioWorklet behavior and live Prisma/Timbre sessions require separate validation.
+
+## Testing and validation
+
+### Backend
 
 ~~~bash
 source .venv/bin/activate
-pytest -q
+python -m pytest -q
 ~~~
 
-Focused examples:
+Tests cover authentication, ownership isolation, upload validation, OCR, chunking, embeddings, FAISS/BM25/RRF retrieval, reranking, page retrieval, document intelligence, multilingual language handling, voice services, intent routing, guardrails, evaluation, persistence and observability helpers.
 
-~~~bash
-pytest -q tests/test_conversational_intents.py \
-  tests/test_shared_intent.py \
-  tests/test_intent_orchestration.py \
-  tests/test_voice_orchestration.py \
-  tests/test_page_retrieval_service.py \
-  tests/test_evaluation_service.py
-~~~
+At the time of this README update, the targeted voice/RAG validation selection passed **178 tests** locally. This is not a claim that the full suite or live external providers have been verified in every environment.
 
-Frontend build:
+### Frontend
 
 ~~~bash
 cd frontend/intelliground-web
 npm run build
+npm run lint
 ~~~
 
-Tests cover authentication, ownership isolation, upload validation, OCR, chunking, embeddings, FAISS/BM25/RRF retrieval, reranking, page retrieval, document intelligence, voice services, intent routing, guardrails, evaluation, persistence, and observability helpers.
+The frontend build is TypeScript-checked and bundled with Vite. Lint currently reports warnings in existing code; warnings are not browser verification.
 
-Focused validation has passed in this repository, including voice/orchestration suites and the frontend build. The full suite should be run in the target environment; model, OCR, and indexing tests can take substantially longer. Focused results must not be presented as production-readiness evidence.
+## Deployment
 
-## Security and privacy
+The repository provides a Python 3.11 backend Dockerfile and a Docker Compose file with one backend service:
 
-Implemented protections include:
+~~~bash
+docker compose up --build backend
+~~~
 
-- password hashing and signed browser sessions;
-- authentication and request rate limiting;
-- per-user active-document registries and storage paths;
-- ownership checks for conversations, answers, evaluations, and page images;
-- active-document checks before retrieval;
-- file type, size, page-count, and upload-job validation;
-- input and semantic guardrails;
-- document-content prompt-injection inspection;
-- output guardrails;
-- safe fallback responses when evidence is insufficient;
-- protected Developer Settings and human-review operations;
-- redacted operational logging;
-- rejection of secrets and user content from LangSmith metadata fields.
+The container installs Tesseract language packs, runs Uvicorn on port 8000 as a non-root user, and mounts storage and logs. The frontend is not packaged by the checked-in Compose file. No EC2-specific scripts, infrastructure definitions or production reverse-proxy configuration are present, so EC2 is not documented here as a verified workflow.
 
-Limitations remain: local development can intentionally enable an auth bypass, external provider security depends on configuration, and no evaluation system guarantees correctness. Keep .env, uploaded documents, indexes, databases, and logs outside source control.
+## Security
+
+Implemented controls include:
+
+- password hashing and signed browser access tokens;
+- optional Google OAuth configuration;
+- authentication, developer-access and authentication-specific rate limiting;
+- per-user document, conversation, evaluation and page-image ownership checks;
+- active-document and RAG authorization before retrieval;
+- PDF type, size, page-count and upload validation;
+- semantic/input guardrails, document prompt-injection inspection and output guardrails;
+- protected human-review and developer endpoints;
+- sanitized provider errors and redacted operational logging;
+- LangSmith metadata allow-listing that rejects questions, answers, prompts, PDF text, audio, credentials and tokens.
+
+Keep .env, uploaded documents, indexes, databases and logs out of commits. LOCAL_DEV_AUTH_BYPASS=true is intended only for explicitly local development.
 
 ## Limitations and roadmap
 
-### Current limitations
+Current limitations:
 
-- LangSmith is a safe configuration foundation, not automatic tracing for every RAG request.
-- Reranking is disabled by default and depends on local model availability.
-- Voice output support depends on verified Gnani mappings, not only the broader text registry.
-- The current Compose file defines no frontend service; the frontend runs with Vite.
-- Full-suite runtime can be long because of model, OCR, and indexing tests.
-- Conversation context is bounded to recent persisted turns.
-- Evaluation quality depends on retrieved evidence, configured models, and judge availability.
-- No license file was present during inspection.
+- LangSmith is a metadata-only foundation and is not automatically attached to every normal RAG request.
+- Cross-encoder reranking is optional, disabled by default and model-download dependent.
+- Evon requires official credentials and an explicit compatible base URL; the repository does not infer one.
+- Gnani voice mappings are provider-dependent; Urdu voice is intentionally unsupported in the current allow-list.
+- Live provider, browser microphone and end-to-end multi-viewport validation are not represented by unit-test results.
+- Compose does not include the frontend.
+- No LICENSE file was found in the repository.
 
-### Near-term roadmap
+Planned improvements:
 
-1. Connect metadata-only LangSmith traces to shared orchestration.
-2. Add deployment packaging for the Vite frontend.
-3. Expand browser and live-provider tests for upload, evidence, evaluation, and voice permissions.
-4. Expand multilingual intent examples and provider-verified voice mappings.
-5. Improve structured memory for topic references and unfinished explanations.
-6. Add operational metrics and documented index/model refresh procedures.
+1. Add browser-level tests for authentication, upload, scrolling, text/voice switching and microphone cleanup.
+2. Add live-provider smoke tests behind explicit opt-in credentials.
+3. Integrate metadata-only LangSmith tracing into shared orchestration after privacy review.
+4. Add a documented frontend deployment target and production reverse-proxy configuration.
+5. Publish repeatable retrieval/OCR benchmark procedures and model/index refresh guidance.
 
-## Project status
+## Contributing and license
 
-IntelliGround is an active engineering project. Its strongest guarantees are architectural and validation-oriented; model quality, external provider availability, and deployment configuration still require environment-specific verification.
+Before opening a change:
+
+1. Inspect the relevant route, service, model and test boundaries.
+2. Add or update focused tests for behavior changes.
+3. Run backend tests and frontend build/lint.
+4. Run git diff --check.
+5. Keep secrets, runtime storage and generated model artifacts out of commits.
+
+No LICENSE file was present during repository inspection. Do not assume or advertise an open-source license until the project owner adds one.
+
+## Contact
+
+Repository: [https://github.com/Saalim02/IntelliGround](https://github.com/Saalim02/IntelliGround)
