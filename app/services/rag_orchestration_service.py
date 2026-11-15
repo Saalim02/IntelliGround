@@ -282,6 +282,10 @@ def _intent_response(request: QueryRequest, intent, *, endpoint: str, conversati
             "message": "Conversational response generated.",
         }
     if intent_name in {"CLARIFY_RESPONSE", "DOCUMENT_CLARIFICATION", "AMBIGUOUS_QUERY"}:
+        logger.info(
+            "clarification decision: reason=classified_ambiguous intent=%s confidence=%s question_language=%s response_language=%s",
+            intent_name, intent.confidence, request.query_language, request.response_language,
+        )
         return {
             "status": "clarification_required", "active_document": None, "question": request.question,
             "question_type": intent_name, "answer": None,
@@ -458,7 +462,14 @@ def run_document_query(
                         response_language=request.response_language,
                     )
                 if semantic is not None:
-                    intent = semantic
+                    if intent.intent is IntentType.DOCUMENT_QUERY and semantic.intent in {IntentType.DOCUMENT_CLARIFICATION, IntentType.AMBIGUOUS_QUERY}:
+                        logger.info(
+                            "semantic clarification overridden: reason=active_document_factual_fallback local_intent=%s semantic_intent=%s question_language=%s document_id=%s",
+                            intent.intent.value, semantic.intent.value, request.query_language,
+                            (active_document or {}).get("active_doc_id"),
+                        )
+                    else:
+                        intent = semantic
             conversational_answer = None
             if intent.intent.value in {"CASUAL_CONVERSATION", "GENERAL_CONVERSATION", "GENERAL_INFORMATION"}:
                 conversational_answer = generate_conversational_response(
@@ -512,7 +523,14 @@ def run_document_query(
                 response_language=request.response_language,
             )
         if semantic is not None:
-            intent = semantic
+            if intent.intent is IntentType.DOCUMENT_QUERY and not semantic.requires_retrieval:
+                logger.info(
+                    "semantic non-retrieval downgrade overridden: reason=active_document_factual_fallback local_intent=%s semantic_intent=%s question_language=%s document_id=%s",
+                    intent.intent.value, semantic.intent.value, request.query_language,
+                    (get_active(current_user.id) or {}).get("active_doc_id"),
+                )
+            else:
+                intent = semantic
 
     semantic_security_result = semantic_classify(
         question=request.question,
@@ -649,6 +667,15 @@ def run_document_query(
                     translated_output["retrieval_query_language"] = source_language
                     retrieval_output = translated_output
                     retrieval_language = source_language
+
+    logger.info(
+        "retrieval decision: document_id=%s query_language=%s document_language=%s retrieval_language=%s intent=%s status=%s chunks=%s pages=%s scores=%s clarification=false",
+        active_doc_id, request.query_language, (active_doc or {}).get("evidence_language"),
+        retrieval_language, intent.intent.value, retrieval_output.get("status"),
+        [chunk.get("chunk_id") for chunk in retrieval_output.get("retrieved_chunks", [])],
+        [chunk.get("page_number") for chunk in retrieval_output.get("retrieved_chunks", [])],
+        [chunk.get("score") for chunk in retrieval_output.get("retrieved_chunks", [])],
+    )
 
     if retrieval_output["status"] != "success":
         page_error_message = None

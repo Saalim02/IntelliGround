@@ -26,7 +26,7 @@ def _dependencies(captured):
     def hybrid_retrieve(query, user_id):
         captured.setdefault("hybrid", []).append((query, user_id))
         return {
-            "status": "success", "active_document": "source.pdf",
+            "status": "success", "active_document": "source.pdf", "document_id": "doc-1",
             "confidence": "high", "best_score": 0.8, "average_score": 0.8,
             "retrieved_chunks": [{
                 "chunk_id": 10, "file_name": "source.pdf", "page_number": 2,
@@ -407,6 +407,66 @@ def test_out_of_scope_and_ambiguous_follow_up_do_not_retrieve():
         )
         assert "hybrid" not in captured and "pages" not in captured
         assert result["status"] in {"out_of_scope", "clarification_required"}
+
+
+@pytest.mark.parametrize(
+    ("question", "document_language"),
+    [
+        ("Covid संकट के दौरान डॉक्टरों की भूमिका क्या है?", "kn"),
+        ("ಕೋವಿಡ್ ಸಂಕಷ್ಟದ ಸಮಯದಲ್ಲಿ ವೈದ್ಯರ ಪಾತ್ರವೇನು?", "kn"),
+        ("Covid संकट के दौरान डॉक्टरों की भूमिका क्या है?", "en"),
+    ],
+)
+def test_clear_multilingual_document_question_overrides_semantic_clarification(question, document_language):
+    captured = {}
+    dependencies = _dependencies(captured)
+    dependencies["get_active_document"] = lambda _user_id: {
+        "active_doc_id": "doc-multilingual", "active_filename": "source.pdf",
+        "evidence_language": document_language,
+    }
+    dependencies["classify_intent_semantically"] = lambda **_kwargs: IntentClassification(
+        IntentType.DOCUMENT_CLARIFICATION, 0.91, (), False, "NONE", False,
+        response_action="REQUEST_CLARIFICATION", response_language="hi",
+    )
+
+    result = run_document_query(
+        QueryRequest(
+            question=question, response_language="hi", use_semantic_intent=True,
+            conversation_id="voice-session-1",
+        ),
+        SimpleNamespace(id=7), endpoint="/api/voice", dependencies=dependencies,
+    )
+
+    assert result["status"] == "success"
+    assert result["response_language"] == "hi"
+    assert result["document_id"] == "doc-1"
+    assert captured["hybrid"] == [(question, 7)]
+    assert result["evidence"][0]["page_number"] == 2
+
+
+def test_valid_document_suggestion_is_not_clarified_by_semantic_router():
+    captured = {}
+    dependencies = _dependencies(captured)
+    dependencies["get_active_document"] = lambda _user_id: {
+        "active_doc_id": "kn-doc", "active_filename": "source.pdf", "evidence_language": "kn",
+    }
+    dependencies["classify_intent_semantically"] = lambda **_kwargs: IntentClassification(
+        IntentType.AMBIGUOUS_QUERY, 0.88, (), False, "NONE", False,
+        response_action="REQUEST_CLARIFICATION", response_language="hi",
+    )
+    result = run_document_query(
+        QueryRequest(
+            question="Covid ಸಂಕಷ್ಟದ ಸಮಯದಲ್ಲಿ ವೈದ್ಯರ ಪಾತ್ರವೇನು?", response_language="hi",
+            use_semantic_intent=True,
+            suggestion_provenance={
+                "document_id": "kn-doc", "answerability": "validated",
+                "supporting_chunk_ids": [10],
+            },
+        ),
+        SimpleNamespace(id=7), endpoint="/api/voice", dependencies=dependencies,
+    )
+    assert result["status"] == "success"
+    assert captured["hybrid"]
 
 
 def test_text_and_voice_share_page_routing():

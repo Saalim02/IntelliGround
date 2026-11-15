@@ -60,6 +60,22 @@ def test_prisma_provider_language_metadata_is_normalized():
     assert prisma.provider_detected_language({"type": "transcript", "language": "unknown"}) is None
 
 
+@pytest.mark.parametrize(
+    ("event", "expected"),
+    [
+        ({"type": "transcript", "text": "ಕೋವಿಡ್ ಪ್ರಶ್ನೆ"}, "ಕೋವಿಡ್ ಪ್ರಶ್ನೆ"),
+        ({"type": "transcript", "data": {"text": "कोविड प्रश्न", "confidence": 0.94}}, "कोविड प्रश्न"),
+        ({"type": "transcript", "result": {"transcript": "What is the answer?"}}, "What is the answer?"),
+    ],
+)
+def test_voice_transcript_text_is_extracted_from_provider_event_shapes(event, expected):
+    assert voice._provider_transcript_text(event) == expected
+
+
+def test_voice_transcript_confidence_is_read_without_audio_logging():
+    assert voice._provider_transcript_confidence({"type": "transcript", "data": {"confidence": 0.88}}) == 0.88
+
+
 def test_prisma_logs_sanitized_upstream_rejection(monkeypatch, caplog):
     monkeypatch.setattr(prisma, "GNANI_API_KEY", "test-key")
     monkeypatch.setattr(

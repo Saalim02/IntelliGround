@@ -554,25 +554,43 @@ async def voice_stream(websocket: WebSocket, conversation_id: str):
             async for message in provider:
                 event = parse_provider_message(message)
                 detected_provider_language = provider_detected_language(event)
+                transcript_text = _provider_transcript_text(event)
+                if transcript_text:
+                    # Prisma may place completed transcript fields in data or
+                    # result. Normalize only the text metadata; never log or
+                    # forward raw audio through this path.
+                    event["text"] = transcript_text
+                    if detected_provider_language and not event.get("detected_language_code"):
+                        event["detected_language_code"] = detected_provider_language
+                logger.info(
+                    "voice_stt_event session_id=%s type=%s detected_language=%s status=%s",
+                    conversation_id, event.get("type"), detected_provider_language,
+                    event.get("status") or event.get("event") or "received",
+                )
                 await websocket.send_json(event)
-                if event.get("type") == "transcript" and event.get("text"):
+                if event.get("type") == "transcript" and transcript_text:
                     # Prisma can emit interim transcript events. They remain
                     # visible to the client but must not start or cancel a
                     # grounded turn until the utterance is final.
                     if not _provider_transcript_is_final(event):
                         continue
-                    request_id = event.get("request_id")
+                    request_id = event.get("request_id") or _provider_transcript_request_id(event)
                     if request_id and request_id in processed_request_ids:
                         logger.warning("voice_duplicate_transcript_ignored user_id=%s conversation_id=%s request_id=%s", user.id, conversation_id, request_id)
                         continue
                     if request_id:
                         processed_request_ids.add(request_id)
+                    logger.info(
+                        "voice_stt_final_transcript session_id=%s detected_language=%s confidence=%s chars=%s transcript=%s",
+                        conversation_id, detected_provider_language,
+                        _provider_transcript_confidence(event), len(transcript_text), transcript_text,
+                    )
                     async with turn_lock:
                         await cancel_active_turn()
-                        await websocket.send_json({"type": "processing", "text": event["text"]})
+                        await websocket.send_json({"type": "processing", "text": transcript_text})
                         active_turn_task = asyncio.create_task(
                             _process_stream_turn(
-                                websocket, user, conversation_id, event["text"], first, request_id,
+                                websocket, user, conversation_id, transcript_text, first, request_id,
                                 generation=response_generation,
                                 is_current=lambda generation=response_generation: generation == response_generation,
                                 provider_language=detected_provider_language,
@@ -713,6 +731,49 @@ def _provider_transcript_is_final(event: dict) -> bool:
     if event_type in {"partial", "interim", "transcript_partial", "speech_partial"}:
         return False
     return True
+
+
+def _provider_transcript_text(event: dict) -> str:
+    """Extract Prisma transcript text from top-level or nested event data."""
+    candidates = [event]
+    for key in ("data", "result", "transcript"):
+        value = event.get(key)
+        if isinstance(value, dict):
+            candidates.append(value)
+    for candidate in candidates:
+        for key in ("text", "transcript"):
+            value = candidate.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return ""
+
+
+def _provider_transcript_confidence(event: dict) -> float | None:
+    candidates = [event]
+    for key in ("data", "result", "transcript"):
+        value = event.get(key)
+        if isinstance(value, dict):
+            candidates.append(value)
+    for candidate in candidates:
+        for key in ("confidence", "transcript_confidence", "confidence_score"):
+            value = candidate.get(key)
+            if isinstance(value, (int, float)):
+                return float(value)
+    return None
+
+
+def _provider_transcript_request_id(event: dict) -> str | None:
+    candidates = [event]
+    for key in ("data", "result", "transcript"):
+        value = event.get(key)
+        if isinstance(value, dict):
+            candidates.append(value)
+    for candidate in candidates:
+        for key in ("request_id", "segment_id"):
+            value = candidate.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return None
 
 
 async def _process_stream_turn(websocket, user, conversation_id, transcript, auth, provider_request_id, *, generation=0, is_current=None, provider_language=None, response_length="medium", response_emotion="AUTO"):

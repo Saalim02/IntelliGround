@@ -86,6 +86,7 @@ def test_websocket_auth_validates_user_activity_and_token_version(monkeypatch):
 
 def test_stream_turn_preserves_conversation_context_and_tts(monkeypatch):
     captured = {}
+    tts_calls = []
     conversation = SimpleNamespace(
         id="conversation-1",
         user_id=9,
@@ -107,7 +108,7 @@ def test_stream_turn_preserves_conversation_context_and_tts(monkeypatch):
         return {"status": "success", "answer": "उत्तर", "evidence": [{"page_number": 4, "snippet": "मूल अनुच्छेद"}], "evaluation": {"evaluation_id": "eval-1", "decision": "AUTO_APPROVE"}}
 
     monkeypatch.setattr(voice, "run_document_query", fake_query)
-    monkeypatch.setattr(voice, "synthesize_speech", lambda text, language: (b"RIFF", "audio/wav"))
+    monkeypatch.setattr(voice, "synthesize_speech", lambda text, language: tts_calls.append((text, language)) or (b"RIFF", "audio/wav"))
 
     async def no_stream(*_args, **_kwargs):
         if False:
@@ -145,6 +146,7 @@ def test_stream_turn_preserves_conversation_context_and_tts(monkeypatch):
     speaking = socket.messages[0]
     assert speaking["evidence"] == [{"page_number": 4, "snippet": "मूल अनुच्छेद"}]
     assert speaking["evaluation"]["evaluation_id"] == "eval-1"
+    assert tts_calls == [("उत्तर", "hi")]
 
 
 def test_stream_turn_speaks_review_message(monkeypatch):
