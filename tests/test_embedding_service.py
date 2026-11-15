@@ -22,6 +22,7 @@ def test_embedding_model_uses_multilingual_e5(monkeypatch):
     assert captured["encode_kwargs"] == {
         "normalize_embeddings": True,
         "prompt": "passage: ",
+        "batch_size": embedding_service.EMBEDDING_BATCH_SIZE,
     }
 
     assert captured["query_encode_kwargs"] == {

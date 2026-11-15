@@ -27,6 +27,13 @@ def get_user_vectorstore_dir(user_id: int) -> Path:
     return path
 
 
+def get_user_document_vectorstore_dir(user_id: int, document_id: str) -> Path:
+    """Return the immutable retrieval-index directory for one document."""
+    path = get_user_storage_dir(user_id) / "vectorstores" / str(document_id)
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 def get_user_page_image_dir(user_id: int) -> Path:
     path = get_user_storage_dir(user_id) / "page_images"
     path.mkdir(parents=True, exist_ok=True)

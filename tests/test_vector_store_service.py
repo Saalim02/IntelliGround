@@ -7,6 +7,33 @@ from pathlib import Path
 from app.services import vector_store_service
 
 
+def test_batched_embedding_adapter_bounds_document_calls():
+    class FakeEmbeddings:
+        def __init__(self):
+            self.calls = []
+
+        def embed_documents(self, texts):
+            self.calls.append(list(texts))
+            return [[float(len(text))] for text in texts]
+
+        def embed_query(self, text):
+            return [float(len(text))]
+
+    progress = []
+    embeddings = FakeEmbeddings()
+    adapter = vector_store_service._BatchedEmbeddings(
+        embeddings,
+        batch_size=2,
+        progress_callback=lambda completed, total: progress.append((completed, total)),
+    )
+
+    vectors = adapter.embed_documents(["a", "bb", "ccc", "dddd", "eeeee"])
+
+    assert vectors == [[1.0], [2.0], [3.0], [4.0], [5.0]]
+    assert embeddings.calls == [["a", "bb"], ["ccc", "dddd"], ["eeeee"]]
+    assert progress == [(1, 3), (2, 3), (3, 3)]
+
+
 # --------------------------------------------------
 # VECTORSTORE DIRECTORY TESTS
 # --------------------------------------------------
@@ -41,6 +68,19 @@ def test_vectorstore_directory_uses_legacy_path_without_user(
     result = vector_store_service._get_vectorstore_dir()
 
     assert result == tmp_path / "legacy-vectorstore"
+
+
+def test_document_vectorstores_are_isolated_by_document_id(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        vector_store_service,
+        "get_user_document_vectorstore_dir",
+        lambda user_id, document_id: tmp_path / "users" / str(user_id) / "vectorstores" / document_id,
+    )
+    first = vector_store_service._get_vectorstore_dir(7, "pdf-a")
+    second = vector_store_service._get_vectorstore_dir(7, "pdf-b")
+    assert first != second
+    assert first.name == "pdf-a"
+    assert second.name == "pdf-b"
 
 
 # --------------------------------------------------

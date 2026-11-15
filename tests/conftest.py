@@ -7,12 +7,19 @@ behaviour used by the existing tests.
 """
 
 import asyncio
+import os
 from http.cookies import SimpleCookie
 from typing import Any
 
 import httpx
 import fastapi.testclient
 import anyio.to_thread
+
+# The repository .env enables LangSmith for local application runs. Tests must
+# not synchronously contact an external observability endpoint: ordinary test
+# cases should measure application behavior, while LangSmith-specific tests
+# explicitly enable tracing through monkeypatch.
+os.environ.setdefault("LANGSMITH_TRACING", "false")
 
 
 async def _run_sync_without_worker(

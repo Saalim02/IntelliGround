@@ -33,7 +33,7 @@ def test_pdf_at_page_limit_is_allowed(monkeypatch):
     assert result["pages"] == []
 
 
-def test_pdf_above_page_limit_is_blocked(monkeypatch):
+def test_pdf_above_previous_page_limit_is_allowed(monkeypatch):
     fake_doc = FakeDocument(1401)
 
     monkeypatch.setattr(
@@ -42,12 +42,9 @@ def test_pdf_above_page_limit_is_blocked(monkeypatch):
         lambda _: fake_doc,
     )
 
-    with pytest.raises(
-        ValueError,
-        match="maximum allowed page count of 1400 pages",
-    ):
-        pdf_service.extract_text_from_pdf("test.pdf")
+    result = pdf_service.extract_text_from_pdf("test.pdf")
 
+    assert result["total_pages"] == 1401
     assert fake_doc.closed is True
 
 

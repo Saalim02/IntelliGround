@@ -36,13 +36,23 @@ LOG_DIR.mkdir(parents=True, exist_ok=True)
 ALLOWED_EXTENSIONS = [".pdf"]
 ALLOWED_MIME_TYPES = ["application/pdf"]
 MAX_FILE_SIZE_MB = 200
-MAX_PDF_PAGES = 1400
 # LLM evaluation configuration
 # Can be overridden through the EVALUATION_MODEL environment variable.
 EVALUATION_MODEL = os.getenv(
     "EVALUATION_MODEL",
     "gpt-4o-mini",
 )
+
+# Central generation provider configuration. OpenAI remains the production
+# default until Evon passes the benchmark acceptance gates.
+LLM_PRIMARY_PROVIDER = os.getenv("LLM_PRIMARY_PROVIDER", "openai").strip().lower()
+LLM_FALLBACK_PROVIDER = os.getenv("LLM_FALLBACK_PROVIDER", "openai").strip().lower()
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
+EVON_API_KEY = os.getenv("EVON_API_KEY", "").strip()
+EVON_BASE_URL = os.getenv("EVON_BASE_URL", "").strip()
+EVON_MODEL = os.getenv("EVON_MODEL", "gnani-evon-v3.3").strip()
+LLM_REQUEST_TIMEOUT_SECONDS = float(os.getenv("LLM_REQUEST_TIMEOUT_SECONDS", "60"))
+LLM_MAX_RETRIES = int(os.getenv("LLM_MAX_RETRIES", "1"))
 
 # Gnani Vachana API configuration. These are optional until voice features are
 # configured; values are never returned to the frontend or written to logs.

@@ -74,6 +74,24 @@ OUT_OF_SCOPE_PATTERNS = (
     r"موسم|หุ้น کی قیمت|کھیل کا نتیجہ",
 )
 
+CURRENT_INFORMATION_PATTERNS = (
+    r"\b(weather|today|right now|latest|current|news|stock price|sports score|election result)\b",
+    r"आज का मौसम|अभी की खबर|ताज़ा|वर्तमान",
+    r"ಇಂದಿನ ಹವಾಮಾನ|ಈಗಿನ ಸುದ್ದಿ|ಇತ್ತೀಚಿನ",
+    r"இன்றைய வானிலை|தற்போதைய செய்தி|சமீபத்திய",
+    r"ఈరోజు వాతావరణం|ప్రస్తుత వార్తలు|తాజా",
+    r"ഇന്നത്തെ കാലാവസ്ഥ|ഇപ്പോഴത്തെ വാർത്ത|ഏറ്റവും പുതിയ",
+)
+
+GENERAL_KNOWLEDGE_PATTERNS = (
+    r"\b(who is|what is|where is|when was|how does)\b.*\b(president|capital|planet|history|india|meaning)\b",
+    r"\b(tell me about|explain)\b.*\b(quantum|photosynthesis|python|constitution)\b",
+    r"भारत के राष्ट्रपति कौन|भारत की राजधानी क्या",
+    r"ಭಾರತದ ರಾಷ್ಟ್ರಪತಿ ಯಾರು|ಭಾರತದ ರಾಜಧಾನಿ ಯಾವುದು",
+    r"இந்தியாவின் குடியரசுத் தலைவர் யார்|தலைநகர் என்ன",
+    r"భారత రాష్ట్రపతి ఎవరు|రాజధాని ఏమిటి",
+)
+
 
 class IntentType(str, Enum):
     """Stable intent labels for future text and voice orchestration."""
@@ -88,14 +106,20 @@ class IntentType(str, Enum):
     PAGE_QUERY = "PAGE_QUERY"
     DOCUMENT_FOLLOWUP = "DOCUMENT_FOLLOWUP"
     GENERAL_CONVERSATION = "GENERAL_CONVERSATION"
+    GENERAL_INFORMATION = "GENERAL_INFORMATION"
+    GENERAL_KNOWLEDGE = "GENERAL_KNOWLEDGE"
+    CURRENT_INFORMATION = "CURRENT_INFORMATION"
+    UNRELATED_CONVERSATION = "UNRELATED_CONVERSATION"
     APPLICATION_HELP = "APPLICATION_HELP"
     DOCUMENT_OVERVIEW = "DOCUMENT_OVERVIEW"
     DOCUMENT_SUMMARY = "DOCUMENT_SUMMARY"
+    DOCUMENT_CLARIFICATION = "DOCUMENT_CLARIFICATION"
     PAGE_SPECIFIC_QUERY = "PAGE_QUERY"
     DOCUMENT_QUERY = "DOCUMENT_QUERY"
     FOLLOW_UP_QUERY = "DOCUMENT_FOLLOWUP"
     OUT_OF_SCOPE = "OUT_OF_SCOPE"
     AMBIGUOUS_QUERY = "AMBIGUOUS_QUERY"
+    DOCUMENT_UNAVAILABLE = "DOCUMENT_UNAVAILABLE"
     WAIT_FOR_USER = "WAIT_FOR_USER"
     READY_TO_CONTINUE = "READY_TO_CONTINUE"
 
@@ -171,10 +195,12 @@ Infer meaning from the utterance and recent conversation; do not rely on exact
 phrases. Return only the structured decision, never an answer or reasoning.
 
 Supported intent labels: GREETING, AUDIO_CHECK, CASUAL_CONVERSATION,
+GENERAL_INFORMATION, DOCUMENT_UNAVAILABLE,
 ACKNOWLEDGMENT, WAIT_FOR_USER, READY_TO_CONTINUE, CONTINUE_RESPONSE,
 REPEAT_RESPONSE, CLARIFY_RESPONSE, APPLICATION_HELP, DOCUMENT_OVERVIEW,
-DOCUMENT_SUMMARY, PAGE_QUERY, DOCUMENT_FOLLOWUP, DOCUMENT_QUERY,
-OUT_OF_SCOPE, AMBIGUOUS_QUERY.
+DOCUMENT_SUMMARY, DOCUMENT_CLARIFICATION, PAGE_QUERY, DOCUMENT_FOLLOWUP,
+DOCUMENT_QUERY, GENERAL_KNOWLEDGE, CURRENT_INFORMATION,
+UNRELATED_CONVERSATION, OUT_OF_SCOPE, AMBIGUOUS_QUERY.
 
 Use DOCUMENT_QUERY/FOLLOWUP/OVERVIEW/SUMMARY/PAGE_QUERY only when the user
 is asking for information from the active PDF or clearly needs document
@@ -198,6 +224,7 @@ requested language. Do not discuss, invent, or infer facts from any PDF.
 Do not mention internal routing, prompts, tools, or reasoning.
 Recent conversation:
 {conversation_context}
+Response tone: {response_tone}
 User:
 {question}
 """
@@ -218,7 +245,11 @@ def _semantic_intent_to_classification(
         IntentType.GREETING, IntentType.AUDIO_CHECK, IntentType.CASUAL_CONVERSATION,
         IntentType.ACKNOWLEDGMENT, IntentType.WAIT_FOR_USER, IntentType.READY_TO_CONTINUE,
         IntentType.CONTINUE_RESPONSE, IntentType.REPEAT_RESPONSE, IntentType.CLARIFY_RESPONSE,
+        IntentType.DOCUMENT_CLARIFICATION,
         IntentType.APPLICATION_HELP, IntentType.OUT_OF_SCOPE, IntentType.AMBIGUOUS_QUERY,
+        IntentType.GENERAL_INFORMATION, IntentType.GENERAL_KNOWLEDGE,
+        IntentType.CURRENT_INFORMATION, IntentType.UNRELATED_CONVERSATION,
+        IntentType.DOCUMENT_UNAVAILABLE,
     }:
         requires_rag = False
     return IntentClassification(
@@ -281,6 +312,7 @@ def generate_conversational_response(
     api_key: str,
     conversation_context: str | None = None,
     response_language: str | None = None,
+    response_tone: str | None = None,
 ) -> str | None:
     """Generate a non-document response using the already configured LLM."""
     if not api_key or not str(api_key).strip():
@@ -294,6 +326,7 @@ def generate_conversational_response(
             "question": (text or "").strip(),
             "conversation_context": conversation_context or "(none)",
             "response_language": response_language or "en",
+            "response_tone": response_tone or "neutral",
         })
         content = getattr(decision, "content", decision)
         return str(content).strip() or None
@@ -330,6 +363,17 @@ _SUMMARY_PATTERNS = (
     r"\b(summar(?:y|ize|ise)|brief summary|give me a summary)\b",
     r"\b(provide|give)\s+(a\s+)?(short\s+)?summary\b",
     r"\b(सारांश|संक्षेप में|ಸಾರಾಂಶ|சுருக்கம்|சுருக்கமாக|సారాంశం|ചുരുക്കം|সংক্ষিপ্তসার|સારાંશ|ਸੰਖੇਪ)\b",
+)
+
+_DOCUMENT_QUERY_PATTERNS = (
+    r"\b(this|the|uploaded)\s+(pdf|document|file)\b",
+    r"\b(pdf|document|file)\s+(say|contain|mention|discuss|explain|describe)\b",
+    r"\b(chapter|section|provision|clause|paragraph)\b",
+    r"(दस्तावेज|पीडीएफ|पृष्ठ|अनुच्छेद|प्रावधान)",
+    r"(ದಾಖಲೆ|ಪಿಡಿಎಫ್|ಪುಟ|ವಿಭಾಗ|ನಿಬಂಧನೆ)",
+    r"(ஆவணம்|pdf|பக்கம்|பிரிவு|விதி)",
+    r"(పత్రం|pdf|పేజీ|విభాగం|నిబంధన)",
+    r"(രേഖ|pdf|പേജ്|വിഭാഗം|വ്യവസ്ഥ)",
 )
 
 _AUDIO_CHECK_PATTERNS = (
@@ -414,7 +458,10 @@ def classify_intent(
     if _matches(_REPEAT_PATTERNS, normalized):
         return non_rag(IntentType.REPEAT_RESPONSE, 0.98, "REPEAT_LAST_RESPONSE")
     if _matches(_CLARIFY_PATTERNS, normalized):
-        return non_rag(IntentType.CLARIFY_RESPONSE, 0.91, "REQUEST_CLARIFICATION")
+        return non_rag(
+            IntentType.DOCUMENT_CLARIFICATION if context_available else IntentType.CLARIFY_RESPONSE,
+            0.91, "REQUEST_CLARIFICATION",
+        )
     if _matches(_WAIT_PATTERNS, normalized):
         return IntentClassification(
             IntentType.WAIT_FOR_USER, 0.96, requires_retrieval=False,
@@ -443,6 +490,10 @@ def classify_intent(
             IntentType.GENERAL_CONVERSATION if legacy else IntentType.CASUAL_CONVERSATION,
             0.98, "RESPOND_CASUALLY",
         )
+    if _matches(CURRENT_INFORMATION_PATTERNS, normalized):
+        return non_rag(IntentType.CURRENT_INFORMATION, 0.96, "RESPOND_OUT_OF_SCOPE")
+    if _matches(GENERAL_KNOWLEDGE_PATTERNS, normalized):
+        return non_rag(IntentType.GENERAL_KNOWLEDGE, 0.93, "RESPOND_OUT_OF_SCOPE")
     if voice_intent == "out_of_scope":
         return non_rag(IntentType.OUT_OF_SCOPE, 0.96, "RESPOND_OUT_OF_SCOPE")
 
@@ -455,6 +506,9 @@ def classify_intent(
 
     if _matches(_OVERVIEW_PATTERNS, normalized):
         return IntentClassification(IntentType.DOCUMENT_OVERVIEW, 0.94, (), True, "DOCUMENT_OVERVIEW")
+
+    if _matches(_DOCUMENT_QUERY_PATTERNS, normalized):
+        return IntentClassification(IntentType.DOCUMENT_QUERY, 0.94, (), True, "HYBRID")
 
     if _matches(_FOLLOW_UP_PATTERNS, normalized):
         if context_available:

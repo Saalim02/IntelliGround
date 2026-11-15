@@ -154,6 +154,28 @@ def test_save_and_load_human_review(monkeypatch, tmp_path):
     assert loaded.corrected_answer == review.corrected_answer
 
 
+def test_human_review_updates_canonical_evaluation_and_preserves_original(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(evaluation_storage_service, "EVALUATION_DIR", tmp_path)
+    evaluation = build_evaluation()
+    evaluation_storage_service.save_evaluation(evaluation)
+    review = build_human_review()
+    review.reviewer_id = 7
+
+    updated = evaluation_storage_service.apply_human_review(evaluation, review)
+    loaded = evaluation_storage_service.load_evaluation(evaluation.evaluation_id)
+
+    assert updated.decision == EvaluationDecision.HUMAN_REVIEW
+    assert updated.original_decision == EvaluationDecision.AUTO_APPROVE
+    assert updated.original_answer == "Hybrid retrieval combines multiple retrieval methods."
+    assert updated.corrected_answer == "The corrected answer."
+    assert updated.reviewer_id == 7
+    assert loaded is not None
+    assert loaded.decision == EvaluationDecision.HUMAN_REVIEW
+
+
 def test_load_missing_human_review_returns_none(
     monkeypatch,
     tmp_path,

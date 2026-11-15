@@ -83,6 +83,17 @@ def load_evaluation(
     return EvaluationResult.model_validate(data)
 
 
+def list_evaluations(user_id: int | None = None) -> list[EvaluationResult]:
+    """Load only the evaluations belonging to the requested storage scope."""
+    evaluation_dir = _get_evaluation_dir(user_id)
+    results = []
+    for path in sorted(evaluation_dir.glob("*.json"), key=lambda item: item.stat().st_mtime, reverse=True):
+        evaluation = load_evaluation(path.stem, user_id=user_id)
+        if evaluation:
+            results.append(evaluation)
+    return results
+
+
 def save_human_review(
     review: HumanReview,
     user_id: int | None = None,
@@ -116,6 +127,27 @@ def save_human_review(
         )
 
     return review.evaluation_id
+
+
+def apply_human_review(
+    evaluation: EvaluationResult,
+    review: HumanReview,
+    *,
+    user_id: int | None = None,
+) -> EvaluationResult:
+    """Apply a review to the canonical evaluation while preserving originals."""
+    if evaluation.original_decision is None:
+        evaluation.original_decision = evaluation.decision
+    if evaluation.original_answer is None:
+        evaluation.original_answer = evaluation.answer
+    evaluation.decision = review.decision
+    if review.corrected_answer:
+        evaluation.corrected_answer = review.corrected_answer
+        evaluation.answer = review.corrected_answer
+    evaluation.reviewed_at = review.reviewed_at or datetime.now(timezone.utc)
+    evaluation.reviewer_id = review.reviewer_id
+    save_evaluation(evaluation, user_id=user_id)
+    return evaluation
 
 
 def load_human_review(

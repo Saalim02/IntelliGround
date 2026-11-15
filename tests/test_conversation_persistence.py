@@ -1,136 +1,93 @@
-import json
-from types import SimpleNamespace
-
-import pytest
-from fastapi import HTTPException
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from app.api.routes import query as query_route
 from app.core.database import Base
 from app.models.auth_models import User
-from app.models.conversation_models import ConversationTurn
-from app.models.query_models import QueryRequest
+from app.models.conversation_models import Conversation, ConversationTurn
 from app.services.conversation_service import (
-    add_turn_if_new,
+    add_turn,
     create_conversation,
     get_owned_conversation,
-    validate_conversation_document,
+    save_conversation_panel,
+    serialize_conversation_detail,
+    validate_document_reupload,
 )
 
 
-@pytest.fixture
-def db_user():
-    engine = create_engine("sqlite://", connect_args={"check_same_thread": False})
+def _session():
+    engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(engine)
-    session = sessionmaker(bind=engine)()
-    user = User(email="phase5a@example.com", is_active=True)
-    session.add(user)
-    session.commit()
-    session.refresh(user)
-    try:
-        yield session, user
-    finally:
-        session.close()
-        engine.dispose()
+    return sessionmaker(bind=engine)()
 
 
-def active_document(doc_id="doc-a", filename="a.pdf"):
-    return {
-        "active_doc_id": doc_id,
-        "active_filename": filename,
-        "response_language": "en",
-    }
-
-
-def test_text_route_creates_and_continues_owned_conversation(monkeypatch, db_user):
-    db, user = db_user
-    captured = []
-    monkeypatch.setattr(query_route, "get_active_document", lambda _user_id: active_document())
-
-    def fake_query(request, current_user, **_kwargs):
-        captured.append((request.question, request.conversation_id, request.conversation_context, current_user.id))
-        return {
-            "status": "success", "active_document": "a.pdf", "question": request.question,
-            "question_type": "DOCUMENT", "answer": f"Answer to {request.question}",
-            "confidence": "high", "best_score": 1.0, "average_score": 1.0,
-            "evidence": [{"page_number": 2, "chunk_id": 4, "snippet": "evidence"}],
-            "retrieved_chunks": [],
-            "evaluation": {"evaluation_id": f"eval-{len(captured)}"},
-            "message": "ok",
-        }
-
-    monkeypatch.setattr(query_route, "run_document_query", fake_query)
-    first = query_route.ask_question(
-        QueryRequest(question="What is topic one?", turn_id="turn-1"), user, db,
-    )
-    conversation_id = first["conversation_id"]
-    assert conversation_id
-
-    second = query_route.ask_question(
-        QueryRequest(question="Tell me more.", conversation_id=conversation_id, turn_id="turn-2"), user, db,
-    )
-    assert second["conversation_id"] == conversation_id
-    assert captured[1][1] == conversation_id
-    assert "What is topic one?" in captured[1][2]
-    assert "Answer to What is topic one?" in captured[1][2]
-
-    turns = db.query(ConversationTurn).filter(ConversationTurn.conversation_id == conversation_id).all()
-    assert [turn.role for turn in turns] == ["user", "assistant", "user", "assistant"]
-    assert json.loads(turns[1].evidence_json)[0]["page_number"] == 2
-    assert turns[1].evaluation_id == "eval-1"
-
-
-def test_text_turn_id_prevents_duplicate_persistence(db_user):
-    db, user = db_user
-    conversation = create_conversation(
-        db, user, document=active_document(), mode="text", response_language="en",
-        speech_input_language=None, speech_output_language=None,
-    )
-    first = add_turn_if_new(
-        db, conversation, transcript="Question", answer=None, evidence=[],
-        provider_request_id="client-turn-1", role="user",
-    )
-    duplicate = add_turn_if_new(
-        db, conversation, transcript="Question", answer=None, evidence=[],
-        provider_request_id="client-turn-1", role="user",
-    )
-    assert first is not None
-    assert duplicate is None
-    assert db.query(ConversationTurn).filter(ConversationTurn.conversation_id == conversation.id).count() == 1
-
-
-def test_conversation_ownership_and_document_isolation(db_user):
-    db, user = db_user
-    owner_conversation = create_conversation(
-        db, user, document=active_document(), mode="text", response_language="en",
-        speech_input_language=None, speech_output_language=None,
-    )
-    other = User(email="phase5a-other@example.com", is_active=True)
-    db.add(other)
+def test_panels_and_messages_are_saved_independently_per_conversation():
+    db = _session()
+    first = User(email="first@example.com", is_active=True)
+    second = User(email="second@example.com", is_active=True)
+    db.add_all([first, second])
     db.commit()
+    document = {"active_doc_id": "doc-1", "active_filename": "source.pdf"}
+    first_chat = create_conversation(db, first, document=document, mode="text", response_language="ta", speech_input_language=None, speech_output_language=None, response_length="small", title="Tamil document")
+    second_chat = create_conversation(db, second, document=document, mode="text", response_language="en", speech_input_language=None, speech_output_language=None, response_length="large", title="Other chat")
 
-    with pytest.raises(HTTPException) as missing:
-        get_owned_conversation(db, other, owner_conversation.id)
-    assert missing.value.status_code == 404
+    save_conversation_panel(db, first, first_chat.id, kind="summary", result={"short_summary": "தமிழ் சுருக்கம்"}, response_language="ta", response_length="small")
+    save_conversation_panel(db, first, first_chat.id, kind="topics", result={"topics": [{"title": "Topic", "evidence": [{"page_number": 1, "chunk_id": 1, "text": "source"}]}]}, response_language="ta", response_length="small")
+    add_turn(db, first_chat, transcript="ஒரு கேள்வி", answer="ஒரு பதில்", evidence=[{"page_number": 1, "snippet": "source"}], role="assistant")
 
-    with pytest.raises(HTTPException) as changed:
-        validate_conversation_document(owner_conversation, active_document("doc-b", "b.pdf"))
-    assert changed.value.status_code == 409
+    detail = serialize_conversation_detail(db, get_owned_conversation(db, first, first_chat.id))
+    assert detail["title"] == "Tamil document"
+    assert detail["response_length"] == "small"
+    assert detail["intelligence"]["summary"]["short_summary"] == "தமிழ் சுருக்கம்"
+    assert detail["intelligence"]["topics"]["topics"][0]["evidence"][0]["page_number"] == 1
+    assert detail["intelligence"]["questions"] is None
+    assert detail["messages"][0]["role"] == "assistant"
+
+    other = serialize_conversation_detail(db, get_owned_conversation(db, second, second_chat.id))
+    assert other["intelligence"] == {"summary": None, "topics": None, "questions": None}
+    assert other["messages"] == []
 
 
-def test_existing_client_without_conversation_remains_compatible(monkeypatch, db_user):
-    db, user = db_user
-    monkeypatch.setattr(query_route, "get_active_document", lambda _user_id: None)
-    monkeypatch.setattr(
-        query_route,
-        "run_document_query",
-        lambda request, current_user, **_kwargs: {
-            "status": "error", "active_document": None, "question": request.question,
-            "question_type": "UNANSWERABLE", "answer": None, "confidence": "low",
-            "best_score": None, "average_score": None, "evidence": [],
-            "retrieved_chunks": [], "evaluation": None, "message": "No active PDF uploaded.",
-        },
+def test_conversation_panel_cannot_be_written_by_another_user():
+    db = _session()
+    owner = User(email="owner@example.com", is_active=True)
+    other = User(email="other@example.com", is_active=True)
+    db.add_all([owner, other])
+    db.commit()
+    chat = create_conversation(db, owner, document={"active_doc_id": "doc-1", "active_filename": "source.pdf"}, mode="text", response_language="en", speech_input_language=None, speech_output_language=None)
+
+    try:
+        save_conversation_panel(db, other, chat.id, kind="summary", result={"short_summary": "not allowed"}, response_language="en", response_length="medium")
+    except Exception as exc:
+        assert getattr(exc, "status_code", None) == 404
+    else:
+        raise AssertionError("A conversation panel was written by a different user")
+
+
+def test_conversation_detail_keeps_document_association_for_reactivation():
+    db = _session()
+    owner = User(email="reactivate@example.com", is_active=True)
+    db.add(owner)
+    db.commit()
+    conversation = create_conversation(
+        db, owner,
+        document={"active_doc_id": "doc-b", "active_filename": "b.pdf", "source_path": "/tmp/b.pdf", "evidence_language": "en", "total_pages": 2},
+        mode="text", response_language="en", speech_input_language=None, speech_output_language=None,
     )
-    result = query_route.ask_question(QueryRequest(question="Hello"), user, db)
-    assert result["conversation_id"] is None
+    detail = serialize_conversation_detail(db, conversation)
+    assert detail["document"]["active_doc_id"] == "doc-b"
+    assert detail["document"]["source_path"] == "/tmp/b.pdf"
+
+
+def test_reupload_requires_digest_match_or_explicit_replacement():
+    db = _session()
+    owner = User(email="reupload@example.com", is_active=True)
+    db.add(owner)
+    db.commit()
+    conversation = create_conversation(
+        db, owner,
+        document={"active_doc_id": "doc-a", "active_filename": "a.pdf", "sha256": "known"},
+        mode="text", response_language="en", speech_input_language=None, speech_output_language=None,
+    )
+    assert validate_document_reupload(conversation, filename="a.pdf", sha256="known") == (True, "verified")
+    assert validate_document_reupload(conversation, filename="other.pdf", sha256="wrong")[0] is False
+    assert validate_document_reupload(conversation, filename="other.pdf", sha256="wrong", confirmed_replacement=True)[0] is True

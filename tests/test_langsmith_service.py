@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+from datetime import datetime
 
 import pytest
 
@@ -52,6 +53,20 @@ def test_enabled_trace_uses_project_and_safe_metadata(monkeypatch):
     handle.finish()
     assert calls[0][1]["project_name"] == "intelliground"
     assert calls[0][1]["extra"]["metadata"]["route"] == "test"
+
+
+def test_trace_finalization_uses_sdk_datetime(monkeypatch):
+    configure(monkeypatch)
+    calls = []
+
+    class FakeClient:
+        def create_run(self, **_kwargs): pass
+        def update_run(self, *args, **kwargs): calls.append((args, kwargs))
+
+    monkeypatch.setattr(service, "_client", lambda: FakeClient())
+    handle = service.start_trace("test_operation")
+    handle.finish()
+    assert isinstance(calls[0][1]["end_time"], datetime)
 
 
 def test_sdk_initialization_failure_is_safe(monkeypatch):

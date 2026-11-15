@@ -69,3 +69,14 @@ def test_expired_developer_session_is_rejected(monkeypatch):
     response = client.get("/api/developer/dashboard", headers=headers)
     assert response.status_code == 403
     client.cookies.delete(DEVELOPER_ACCESS_COOKIE)
+
+
+def test_developer_evaluation_config_is_protected_and_readable(monkeypatch):
+    DEVELOPER_ACCESS_RATE_LIMITER.reset()
+    _, headers = auth_user()
+    assert client.get("/api/developer/evaluation-config", headers=headers).status_code == 403
+    unlock(headers, monkeypatch)
+    response = client.get("/api/developer/evaluation-config", headers=headers)
+    assert response.status_code == 200
+    assert response.json()["auto_approve_threshold"] >= response.json()["review_recommended_threshold"]
+    client.cookies.delete(DEVELOPER_ACCESS_COOKIE)

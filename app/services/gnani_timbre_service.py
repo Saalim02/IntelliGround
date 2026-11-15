@@ -12,28 +12,46 @@ import websockets
 
 from app.core.config import GNANI_API_KEY, GNANI_REQUEST_TIMEOUT_SECONDS, GNANI_TTS_MODEL, GNANI_TTS_URL, GNANI_TTS_VOICE, GNANI_TTS_WS_URL
 from app.services.gnani_prisma_service import VOICE_LANGUAGE_CODES, GnaniConfigurationError, GnaniProviderError
+from app.services.voice_catalogue import validate_voice_language
 from app.services.observability.langsmith_service import observed
 
+# Timbre v2.5's current integration contract does not advertise a verified
+# emotion/prosody field. Keep this empty until the provider exposes one.
+SUPPORTED_TTS_EMOTIONS = frozenset()
 
-def _validate(text: str, language: str) -> None:
+
+def _validate(text: str, language: str, voice: str | None = None) -> None:
     if not text.strip():
         raise GnaniProviderError("Text-to-speech input is empty.")
-    if not GNANI_API_KEY or not GNANI_TTS_MODEL or not GNANI_TTS_VOICE:
+    if not GNANI_API_KEY or not GNANI_TTS_MODEL or not (voice or GNANI_TTS_VOICE):
         raise GnaniConfigurationError("Gnani Timbre requires GNANI_API_KEY, GNANI_TTS_MODEL, and GNANI_TTS_VOICE.")
     if language not in VOICE_LANGUAGE_CODES:
         raise GnaniConfigurationError(f"Gnani Timbre does not have a verified mapping for language '{language}'.")
+    selected_voice = voice or GNANI_TTS_VOICE
+    if GNANI_TTS_MODEL != "timbre-v2.5":
+        raise GnaniConfigurationError("IntelliGround Voice Studio requires GNANI_TTS_MODEL=timbre-v2.5.")
+    try:
+        validate_voice_language(selected_voice, language)
+    except ValueError as exc:
+        raise GnaniConfigurationError(str(exc)) from exc
 
 
-def _payload(text: str, language: str, container: str) -> dict:
-    return {"text": text, "voice": GNANI_TTS_VOICE, "model": GNANI_TTS_MODEL, "language": VOICE_LANGUAGE_CODES[language], "audio_config": {"sample_rate": 48000, "num_channels": 1, "sample_width": 2, "encoding": "linear_pcm", "container": container}}
+def _payload(text: str, language: str, container: str, voice: str | None = None, emotion: str | None = None) -> dict:
+    payload = {"text": text, "voice": voice or GNANI_TTS_VOICE, "model": GNANI_TTS_MODEL, "language": VOICE_LANGUAGE_CODES[language], "audio_config": {"sample_rate": 48000, "num_channels": 1, "sample_width": 2, "encoding": "linear_pcm", "container": container}}
+    if emotion in SUPPORTED_TTS_EMOTIONS:
+        payload["emotion"] = emotion
+    return payload
 
 
 @observed("voice.tts", voice_stage="tts", provider="gnani_timbre")
-def synthesize_speech(text: str, *, language: str) -> tuple[bytes, str]:
+def synthesize_speech(text: str, *, language: str, voice: str | None = None, emotion: str | None = None) -> tuple[bytes, str]:
     """Buffered REST synthesis used by non-realtime callers and fallback."""
-    _validate(text, language)
+    _validate(text, language, voice)
     try:
-        response = httpx.post(GNANI_TTS_URL, headers={"X-API-Key-ID": GNANI_API_KEY, "Content-Type": "application/json"}, json=_payload(text, language, "wav"), timeout=GNANI_REQUEST_TIMEOUT_SECONDS)
+        payload_kwargs = {"voice": voice}
+        if emotion in SUPPORTED_TTS_EMOTIONS:
+            payload_kwargs["emotion"] = emotion
+        response = httpx.post(GNANI_TTS_URL, headers={"X-API-Key-ID": GNANI_API_KEY, "Content-Type": "application/json"}, json=_payload(text, language, "wav", **payload_kwargs), timeout=GNANI_REQUEST_TIMEOUT_SECONDS)
     except httpx.HTTPError as exc:
         raise GnaniProviderError("Gnani Timbre could not be reached.") from exc
     if response.status_code >= 400:
@@ -56,12 +74,15 @@ def _decode_audio_event(message: dict) -> bytes | None:
         raise GnaniProviderError("Gnani Timbre returned an invalid audio chunk.") from exc
 
 
-async def stream_speech(text: str, *, language: str) -> AsyncIterator[dict]:
+async def stream_speech(text: str, *, language: str, voice: str | None = None, emotion: str | None = None) -> AsyncIterator[dict]:
     """Yield ordered raw PCM chunks from the documented Timbre WebSocket."""
-    _validate(text, language)
+    _validate(text, language, voice)
     try:
         async with websockets.connect(GNANI_TTS_WS_URL, additional_headers={"X-API-Key-ID": GNANI_API_KEY, "Content-Type": "application/json"}, open_timeout=GNANI_REQUEST_TIMEOUT_SECONDS, close_timeout=2) as provider:
-            await provider.send(json.dumps(_payload(text, language, "raw")))
+            payload_kwargs = {"voice": voice}
+            if emotion in SUPPORTED_TTS_EMOTIONS:
+                payload_kwargs["emotion"] = emotion
+            await provider.send(json.dumps(_payload(text, language, "raw", **payload_kwargs)))
             sequence = 0
             async for raw in provider:
                 if isinstance(raw, bytes):

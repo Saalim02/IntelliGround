@@ -7,18 +7,24 @@ from app.models.auth_models import User
 from app.models.evaluation_models import HumanReview
 from app.services.evaluation.evaluation_storage_service import (
     append_evaluation_dataset,
+    apply_human_review,
     load_evaluation,
     load_human_review,
+    list_evaluations,
     save_human_review,
 )
+from app.services.evaluation.confidence import configure_evaluation, evaluation_config
+from app.services.emotion_state_service import get_settings, save_settings
 from app.services.observability.langsmith_service import (
     create_connectivity_trace,
     instrumentation_coverage,
     observability_metrics,
+    recent_traces,
     set_tracing_enabled,
     tracing_status,
 )
 from app.services.security.developer_access import get_developer_user
+from app.services.llm.provider_factory import provider_status
 from app.services.security.document_guardrails import inspect_retrieved_chunks
 from app.services.security.guardrails import validate_question
 from app.services.user_storage_service import get_user_evaluation_dir
@@ -36,6 +42,13 @@ class ObservabilityToggleRequest(BaseModel):
     enabled: bool | None = None
 
 
+class EvaluationConfigRequest(BaseModel):
+    auto_approve_threshold: float = Field(ge=0, le=1)
+    review_recommended_threshold: float = Field(ge=0, le=1)
+    critical_grounding_threshold: float = Field(ge=0, le=1)
+    weights: dict[str, float] = Field(default_factory=dict)
+
+
 def _evaluation_summary(evaluation, review):
     data = evaluation.model_dump(mode="json")
     data["review"] = review.model_dump(mode="json") if review else None
@@ -49,7 +62,7 @@ def _evaluation_summary(evaluation, review):
 def developer_dashboard(user: User = Depends(get_developer_user)):
     evaluation_dir = get_user_evaluation_dir(user.id)
     records = []
-    for path in sorted(evaluation_dir.glob("*.json")):
+    for path in sorted(evaluation_dir.glob("*.json"), key=lambda item: item.stat().st_mtime, reverse=True):
         evaluation = load_evaluation(path.stem, user_id=user.id)
         if evaluation:
             records.append(_evaluation_summary(evaluation, load_human_review(path.stem, user.id)))
@@ -58,6 +71,7 @@ def developer_dashboard(user: User = Depends(get_developer_user)):
         "evaluations": records,
         "pending_reviews": pending,
         "counts": {"evaluations": len(records), "pending_reviews": len(pending)},
+        "evaluation_config": evaluation_config(),
         "observability": {
             **tracing_status(),
             "metrics": observability_metrics(),
@@ -66,6 +80,39 @@ def developer_dashboard(user: User = Depends(get_developer_user)):
             "trace_note": "Metrics are process-local and unavailable after a backend restart." if observability_metrics()["available"] else "No trace has been recorded in this backend process.",
         },
     }
+
+
+@router.get("/evaluation-config")
+def get_evaluation_config(user: User = Depends(get_developer_user)):
+    del user
+    return evaluation_config()
+
+
+@router.put("/evaluation-config")
+def update_evaluation_config(
+    request: EvaluationConfigRequest,
+    user: User = Depends(get_developer_user),
+):
+    del user
+    try:
+        return configure_evaluation(request.model_dump())
+    except ValueError as exc:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+@router.get("/emotion-settings")
+def emotion_settings(user: User = Depends(get_developer_user)):
+    del user
+    return get_settings()
+
+@router.put("/emotion-settings")
+def update_emotion_settings(payload: dict, user: User = Depends(get_developer_user)):
+    del user
+    try:
+        return save_settings(payload)
+    except ValueError as exc:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @router.get("/observability")
@@ -79,6 +126,18 @@ def observability_dashboard(user: User = Depends(get_developer_user)):
         "coverage": instrumentation_coverage(),
         "trace_verified": metrics["total_recorded_traces"] > 0,
     }
+
+
+@router.get("/observability/traces")
+def observability_traces(user: User = Depends(get_developer_user)):
+    del user
+    return recent_traces()
+
+
+@router.get("/providers")
+def provider_dashboard(user: User = Depends(get_developer_user)):
+    del user
+    return {"providers": provider_status()}
 
 
 @router.post("/observability/test")
@@ -111,7 +170,13 @@ def review_evaluation(
     if evaluation is None or review.evaluation_id != evaluation_id:
         from fastapi import HTTPException
         raise HTTPException(status_code=404, detail="Evaluation not found.")
+    review.reviewer_id = user.id
+    from datetime import datetime, timezone
+    review.reviewed_at = datetime.now(timezone.utc)
+    review.original_decision = evaluation.decision
+    review.original_answer = evaluation.answer
     save_human_review(review, user_id=user.id)
+    evaluation = apply_human_review(evaluation, review, user_id=user.id)
     append_evaluation_dataset(evaluation, review, user_id=user.id)
     return {"status": "success", "evaluation": _evaluation_summary(evaluation, review)}
 

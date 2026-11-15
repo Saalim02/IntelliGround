@@ -14,6 +14,7 @@ DOCUMENT_PROMPT = "passage: "
 QUERY_PROMPT = "query: "
 
 NORMALIZE_EMBEDDINGS = True
+EMBEDDING_BATCH_SIZE = max(1, int(os.getenv("EMBEDDING_BATCH_SIZE", "64")))
 
 
 def _embedding_identity() -> tuple:
@@ -54,6 +55,7 @@ def _get_embedding_model_cached(
         encode_kwargs={
             "normalize_embeddings": normalize_embeddings,
             "prompt": document_prompt,
+            "batch_size": EMBEDDING_BATCH_SIZE,
         },
         query_encode_kwargs={
             "normalize_embeddings": normalize_embeddings,

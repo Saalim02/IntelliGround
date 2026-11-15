@@ -1,11 +1,27 @@
 import asyncio
 import base64
 import json
+from types import SimpleNamespace
 
 import pytest
 
 from app.services import gnani_prisma_service as prisma
 from app.services import gnani_timbre_service as timbre
+from app.api.routes import voice
+from app.models.voice_models import VoiceSynthesisRequest
+
+
+@pytest.mark.parametrize(
+    ("event", "expected"),
+    [
+        ({"type": "transcript", "is_final": False}, False),
+        ({"type": "transcript", "final": True}, True),
+        ({"type": "transcript", "event": "partial"}, False),
+        ({"type": "transcript", "text": "one utterance"}, True),
+    ],
+)
+def test_provider_transcript_finality_is_conservative(event, expected):
+    assert voice._provider_transcript_is_final(event) is expected
 
 
 class FakeResponse:
@@ -114,6 +130,19 @@ def test_timbre_returns_binary_audio(monkeypatch):
     assert content_type == "audio/wav"
 
 
+def test_timbre_buffered_payload_uses_selected_v25_voice(monkeypatch):
+    monkeypatch.setattr(timbre, "GNANI_API_KEY", "test-key")
+    monkeypatch.setattr(timbre, "GNANI_TTS_MODEL", "timbre-v2.5")
+    calls = {}
+    monkeypatch.setattr(timbre.httpx, "post", lambda _url, **kwargs: calls.update(kwargs=kwargs) or FakeResponse(content=b"RIFF"))
+
+    timbre.synthesize_speech("Hello", language="en", voice="Nalini")
+
+    assert calls["kwargs"]["json"]["model"] == "timbre-v2.5"
+    assert calls["kwargs"]["json"]["voice"] == "Nalini"
+    assert calls["kwargs"]["json"]["language"] == "en-IN"
+
+
 def test_timbre_rejects_unverified_urdu_voice_output(monkeypatch):
     monkeypatch.setattr(timbre, "GNANI_API_KEY", "test-key")
     monkeypatch.setattr(timbre, "GNANI_TTS_MODEL", "timbre-v2.5")
@@ -121,6 +150,63 @@ def test_timbre_rejects_unverified_urdu_voice_output(monkeypatch):
 
     with pytest.raises(timbre.GnaniConfigurationError):
         timbre.synthesize_speech("مرحبا", language="ur")
+
+
+@pytest.mark.parametrize("language", ["en", "kn", "ta", "te", "hi"])
+def test_answer_synthesis_uses_supported_response_language(monkeypatch, language):
+    monkeypatch.setattr(voice, "synthesize_speech", lambda text, language: (b"RIFF", "audio/wav"))
+    response = voice.synthesize_answer(
+        VoiceSynthesisRequest(text="Generated answer", speech_output_language=language),
+        SimpleNamespace(id=7),
+    )
+    assert response.body == b"RIFF"
+    assert response.media_type == "audio/wav"
+
+
+@pytest.mark.parametrize("language", ["en", "kn", "te"])
+@pytest.mark.parametrize("voice_id", ["Kaveri", "Nalini"])
+def test_answer_synthesis_accepts_language_and_selected_voice(monkeypatch, language, voice_id):
+    calls = {}
+    monkeypatch.setattr(
+        voice,
+        "synthesize_speech",
+        lambda text, language, voice=None: calls.update(text=text, language=language, voice=voice) or (b"RIFF", "audio/wav"),
+    )
+    response = voice.synthesize_answer(
+        VoiceSynthesisRequest(text="Answer text", speech_output_language=language, voice_id=voice_id),
+        SimpleNamespace(id=7),
+    )
+    assert response.body == b"RIFF"
+    assert calls == {"text": "Answer text", "language": language, "voice": voice_id}
+
+
+def test_answer_synthesis_rejects_missing_language():
+    with pytest.raises(ValueError, match="speech_output_language"):
+        VoiceSynthesisRequest.model_validate({"text": "Answer text"})
+
+
+def test_answer_synthesis_rejects_unsupported_language():
+    with pytest.raises(ValueError, match="verified Gnani speech support"):
+        VoiceSynthesisRequest(text="Answer text", speech_output_language="ur")
+
+
+def test_answer_synthesis_maps_gnani_errors(monkeypatch):
+    monkeypatch.setattr(
+        voice,
+        "synthesize_speech",
+        lambda *args, **kwargs: (_ for _ in ()).throw(voice.GnaniProviderError("provider rejected request")),
+    )
+    with pytest.raises(voice.HTTPException) as error:
+        voice.synthesize_answer(
+            VoiceSynthesisRequest(text="Answer text", speech_output_language="en"),
+            SimpleNamespace(id=7),
+        )
+    assert error.value.status_code == 502
+
+
+def test_answer_synthesis_rejects_unsupported_language():
+    with pytest.raises(ValueError, match="verified Gnani speech support"):
+        VoiceSynthesisRequest(text="Generated answer", speech_output_language="ur")
 
 
 class FakeTimbreSocket:
@@ -163,6 +249,19 @@ def test_timbre_realtime_preserves_chunk_order_and_payload(monkeypatch):
     assert chunks[-1]["is_final"] is True
     assert socket.sent[0]["audio_config"]["container"] == "raw"
     assert socket.sent[0]["language"] == "en-IN"
+
+
+def test_timbre_realtime_payload_uses_selected_v25_voice(monkeypatch):
+    monkeypatch.setattr(timbre, "GNANI_API_KEY", "test-key")
+    monkeypatch.setattr(timbre, "GNANI_TTS_MODEL", "timbre-v2.5")
+    socket = FakeTimbreSocket([json.dumps({"type": "complete"})])
+    monkeypatch.setattr(timbre.websockets, "connect", lambda *args, **kwargs: socket)
+
+    asyncio.run(_collect(timbre.stream_speech("Hello", language="hi", voice="Nalini")))
+
+    assert socket.sent[0]["voice"] == "Nalini"
+    assert socket.sent[0]["model"] == "timbre-v2.5"
+    assert socket.sent[0]["language"] == "hi-IN"
 
 
 def test_timbre_realtime_provider_error_is_not_silenced(monkeypatch):

@@ -46,6 +46,48 @@ class CrossEncoderReranker:
             logger.exception("Cross-encoder reranker failed; returning explicit unreranked status")
             return candidates[:limit] if limit else candidates, self.status
 
+    def rerank_queries(self, queries: list[str], candidates: list[dict[str, Any]], limit: int | None = None) -> tuple[list[dict[str, Any]], str]:
+        """Rerank against every retrieval-language query and keep the best score.
+
+        Cross-language retrieval can add a translated query while preserving the
+        user's original query. A reranker scored only with the original query can
+        undo that work, especially when the source chunks use another script.
+        """
+        normalized_queries = []
+        for query in queries:
+            if query and query not in normalized_queries:
+                normalized_queries.append(query)
+        if len(normalized_queries) <= 1:
+            return self.rerank(normalized_queries[0] if normalized_queries else "", candidates, limit)
+        if not self.enabled:
+            return candidates[:limit] if limit else candidates, "disabled"
+        if not candidates:
+            return [], "enabled_empty"
+        try:
+            model = self._load()
+            pairs = [
+                (query, item.get("text", ""))
+                for item in candidates
+                for query in normalized_queries
+            ]
+            scores = model.predict(pairs, batch_size=8, show_progress_bar=False)
+            ranked = []
+            offset = 0
+            for item in candidates:
+                candidate_scores = [float(value) for value in scores[offset:offset + len(normalized_queries)]]
+                offset += len(normalized_queries)
+                enriched = dict(item)
+                enriched["reranker_score"] = max(candidate_scores, default=float("-inf"))
+                enriched["reranker_query_count"] = len(normalized_queries)
+                ranked.append(enriched)
+            ranked.sort(key=lambda item: (-item["reranker_score"], item["identity"]))
+            self.status = "enabled_success"
+            return ranked[:limit] if limit else ranked, self.status
+        except Exception:
+            self.status = "enabled_failed"
+            logger.exception("Cross-encoder multi-query reranking failed; returning explicit unreranked status")
+            return candidates[:limit] if limit else candidates, self.status
+
 
 _default_reranker = CrossEncoderReranker()
 

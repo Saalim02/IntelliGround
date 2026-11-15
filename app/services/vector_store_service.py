@@ -13,6 +13,7 @@ from langchain_community.vectorstores import FAISS
 
 from app.services.embedding_service import (
     get_embedding_model,
+    EMBEDDING_BATCH_SIZE,
     EMBEDDING_PROVIDER,
     EMBEDDING_MODEL_NAME,
     EMBEDDING_MODEL_VERSION,
@@ -23,7 +24,7 @@ from app.services.embedding_service import (
 )
 
 from app.core.config import VECTORSTORE_DIR
-from app.services.user_storage_service import get_user_vectorstore_dir
+from app.services.user_storage_service import get_user_document_vectorstore_dir, get_user_vectorstore_dir
 from app.services.bm25_service import (
     BM25Index,
     SPARSE_INDEX_FILENAME,
@@ -34,6 +35,41 @@ from app.services.document_registry_service import get_active_document
 
 
 logger = logging.getLogger(__name__)
+
+
+class _BatchedEmbeddings:
+    """Keep document embedding calls bounded without changing FAISS metadata."""
+
+    def __init__(self, embeddings, batch_size=EMBEDDING_BATCH_SIZE, progress_callback=None):
+        self._embeddings = embeddings
+        self._batch_size = max(1, batch_size)
+        self._progress_callback = progress_callback
+
+    def embed_documents(self, texts):
+        total = len(texts)
+        if not total:
+            return []
+        batch_count = (total + self._batch_size - 1) // self._batch_size
+        vectors = []
+        for batch_number, start in enumerate(range(0, total, self._batch_size), start=1):
+            vectors.extend(self._embeddings.embed_documents(texts[start:start + self._batch_size]))
+            if self._progress_callback:
+                self._progress_callback(batch_number, batch_count)
+        return vectors
+
+    def embed_query(self, text):
+        return self._embeddings.embed_query(text)
+
+    def __getattr__(self, name):
+        return getattr(self._embeddings, name)
+
+
+def _embedding_adapter(embeddings, progress_callback=None):
+    # Keep compatibility with small test doubles and alternate LangChain
+    # implementations that only expose FAISS-compatible constructors.
+    if not hasattr(embeddings, "embed_documents"):
+        return embeddings
+    return _BatchedEmbeddings(embeddings, progress_callback=progress_callback)
 
 
 # --------------------------------------------------
@@ -163,6 +199,7 @@ def convert_chunks_to_documents(
 
 def _get_vectorstore_dir(
     user_id: int | None = None,
+    document_id: str | None = None,
 ) -> Path:
     """
     Returns the vectorstore directory.
@@ -176,14 +213,24 @@ def _get_vectorstore_dir(
 
     if user_id is None:
         return VECTORSTORE_DIR
+    if document_id:
+        return get_user_document_vectorstore_dir(user_id, document_id)
 
     return get_user_vectorstore_dir(user_id)
 
 
+def _resolve_vectorstore_dir(user_id: int | None = None, document_id: str | None = None) -> Path:
+    """Keep older injected directory resolvers working during migration."""
+    try:
+        return _get_vectorstore_dir(user_id, document_id)
+    except TypeError:
+        return _get_vectorstore_dir(user_id)
+
+
 @contextmanager
-def vectorstore_read_lock(user_id: int | None = None):
+def vectorstore_read_lock(user_id: int | None = None, document_id: str | None = None):
     """Prevent reads from interleaving with transactional index replacement."""
-    vectorstore_dir = _get_vectorstore_dir(user_id)
+    vectorstore_dir = _resolve_vectorstore_dir(user_id, document_id)
     vectorstore_dir.parent.mkdir(parents=True, exist_ok=True)
     lock_file = vectorstore_dir.parent / ".vectorstore.lock"
     with lock_file.open("a+") as handle:
@@ -194,6 +241,33 @@ def vectorstore_read_lock(user_id: int | None = None):
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
+def document_vectorstore_available(user_id: int, document_id: str) -> bool:
+    """Return whether a complete, compatible per-document index exists."""
+    vectorstore_dir = _resolve_vectorstore_dir(user_id, document_id)
+    return (
+        vectorstore_dir.is_dir()
+        and _has_compatible_embedding_manifest(vectorstore_dir)
+        and (vectorstore_dir / "index.faiss").is_file()
+        and (vectorstore_dir / "index.pkl").is_file()
+        and (vectorstore_dir / SPARSE_INDEX_FILENAME).is_file()
+    )
+
+
+def document_vectorstore_matches_identity(user_id: int, document_id: str, filename: str) -> bool:
+    """Verify sparse metadata belongs to the requested document namespace."""
+    vectorstore_dir = _resolve_vectorstore_dir(user_id, document_id)
+    if not document_vectorstore_available(user_id, document_id):
+        return False
+    index = load_sparse_index(vectorstore_dir)
+    if index is None or not index.records:
+        return False
+    return all(
+        record.metadata.get("doc_id") == document_id
+        and record.metadata.get("file_name") == filename
+        for record in index.records
+    )
+
+
 # --------------------------------------------------
 # CREATE AND SAVE VECTORSTORE
 # --------------------------------------------------
@@ -201,6 +275,7 @@ def vectorstore_read_lock(user_id: int | None = None):
 def create_and_save_vectorstore(
     documents: list,
     user_id: int | None = None,
+    document_id: str | None = None,
 ):
     """
     Creates and saves a FAISS vectorstore.
@@ -229,7 +304,7 @@ def create_and_save_vectorstore(
         embeddings,
     )
 
-    vectorstore_dir = _get_vectorstore_dir(user_id)
+    vectorstore_dir = _resolve_vectorstore_dir(user_id, document_id)
 
     vectorstore_dir.parent.mkdir(
         parents=True,
@@ -337,12 +412,20 @@ class VectorStoreTransaction:
         return False
 
 
-def begin_vectorstore_transaction(documents: list, user_id: int | None = None):
+def begin_vectorstore_transaction(
+    documents: list,
+    user_id: int | None = None,
+    document_id: str | None = None,
+    progress_callback=None,
+):
     """Build a staged vector store; the caller owns commit/rollback."""
     if not documents:
         raise ValueError("Cannot create vectorstore without documents.")
-    vectorstore = FAISS.from_documents(documents, get_embedding_model())
-    vectorstore_dir = _get_vectorstore_dir(user_id)
+    vectorstore = FAISS.from_documents(
+        documents,
+        _embedding_adapter(get_embedding_model(), progress_callback),
+    )
+    vectorstore_dir = _resolve_vectorstore_dir(user_id, document_id)
     vectorstore_dir.parent.mkdir(parents=True, exist_ok=True)
     staged_dir = Path(tempfile.mkdtemp(
         prefix=".vectorstore_tmp_", dir=str(vectorstore_dir.parent)
@@ -365,6 +448,7 @@ def begin_vectorstore_transaction(documents: list, user_id: int | None = None):
 
 def load_vectorstore(
     user_id: int | None = None,
+    document_id: str | None = None,
 ):
     """
     Loads a FAISS vectorstore only when its embedding
@@ -373,9 +457,9 @@ def load_vectorstore(
     Old indexes without a manifest are rejected.
     """
 
-    vectorstore_dir = _get_vectorstore_dir(user_id)
+    vectorstore_dir = _resolve_vectorstore_dir(user_id, document_id)
 
-    with vectorstore_read_lock(user_id):
+    with vectorstore_read_lock(user_id, document_id):
         if not vectorstore_dir.exists() or not _has_compatible_embedding_manifest(vectorstore_dir):
             return None
         try:
@@ -390,7 +474,7 @@ def load_vectorstore(
                 for path in files
             )
             active = get_active_document(user_id) if user_id is not None else None
-            document_id = (active or {}).get("active_doc_id")
+            document_id = document_id or (active or {}).get("active_doc_id")
             return _load_vectorstore_cached(
                 user_id, document_id, stats, str(vectorstore_dir),
             )
@@ -409,9 +493,9 @@ def _load_vectorstore_cached(user_id: int | None, document_id: str | None, index
     )
 
 
-def load_sparse_vectorstore(user_id: int | None = None):
+def load_sparse_vectorstore(user_id: int | None = None, document_id: str | None = None):
     """Load the sparse index from the same committed directory as FAISS."""
-    vectorstore_dir = _get_vectorstore_dir(user_id)
+    vectorstore_dir = _resolve_vectorstore_dir(user_id, document_id)
     if not vectorstore_dir.exists() or not _has_compatible_embedding_manifest(vectorstore_dir):
         return None
     sparse_path = vectorstore_dir / SPARSE_INDEX_FILENAME

@@ -6,7 +6,6 @@ import fitz
 import pytesseract
 from PIL import Image
 
-from app.core.config import MAX_PDF_PAGES
 
 
 # --------------------------------------------------
@@ -394,6 +393,7 @@ def _perform_ocr(page, language: str) -> str:
 def extract_text_from_pdf(
     pdf_path: str,
     language_hint: str = "auto",
+    progress_callback=None,
 ) -> dict:
     """
     Extract text using native extraction first and OCR fallback.
@@ -433,12 +433,6 @@ def extract_text_from_pdf(
 
         total_pages = len(doc)
 
-        if total_pages > MAX_PDF_PAGES:
-            raise ValueError(
-                f"PDF exceeds the maximum allowed page count "
-                f"of {MAX_PDF_PAGES} pages."
-            )
-
         pages_data = []
 
         pdf_filename = os.path.basename(pdf_path)
@@ -450,7 +444,10 @@ def extract_text_from_pdf(
 
         for page_number, page in enumerate(doc, start=1):
 
-            native_text = page.get_text().strip()
+            # Avoid PyMuPDF's default layout/sorting pass. On some malformed
+            # or very large PDFs that pass can block indefinitely and leave
+            # the upload job at the validation milestone.
+            native_text = page.get_text("text", sort=False).strip()
 
             # Temporary exception for visually inspected empty pages.
             if (
@@ -464,6 +461,9 @@ def extract_text_from_pdf(
                     "extraction_method": "blank",
                 })
 
+                if progress_callback is not None:
+                    progress_callback(page_number, total_pages)
+
                 continue
 
             # Skip visually blank pages.
@@ -473,6 +473,9 @@ def extract_text_from_pdf(
                     "text": "",
                     "extraction_method": "blank",
                 })
+
+                if progress_callback is not None:
+                    progress_callback(page_number, total_pages)
 
                 continue
 
@@ -509,6 +512,9 @@ def extract_text_from_pdf(
                     "text": native_text,
                     "extraction_method": "native",
                 })
+
+            if progress_callback is not None:
+                progress_callback(page_number, total_pages)
 
         return {
             "pages": pages_data,

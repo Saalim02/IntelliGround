@@ -68,11 +68,11 @@ class DebugExportTransaction:
         self.backup_dir = None
 
 
-def export_debug_files(source_filename, pages_data, metadata, user_id: int | None = None, *, commit=True):
+def export_debug_files(source_filename, pages_data, metadata, user_id: int | None = None, document_id: str | None = None, *, commit=True):
     safe_name = Path(source_filename).stem
 
     if user_id is not None:
-        base_dir = get_user_debug_dir(user_id) / safe_name
+        base_dir = get_user_debug_dir(user_id) / (document_id or safe_name)
     else:
         base_dir = DEBUG_OUTPUT_DIR / safe_name
 

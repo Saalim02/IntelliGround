@@ -4,6 +4,7 @@ from typing import Optional
 
 class UploadPDFResponse(BaseModel):
     status: str
+    active_doc_id: Optional[str] = None
     filename: str
     saved_filename: str
     file_size_mb: float

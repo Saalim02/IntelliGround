@@ -1,7 +1,9 @@
 """Shared document-question orchestration for text and voice interfaces."""
 
 import inspect
+import logging
 import os
+import re
 from uuid import uuid4
 
 from app.models.auth_models import User
@@ -28,11 +30,19 @@ from app.services.voice_intent_service import (
     classify_intent_semantically,
     classify_voice_intent,
     generate_conversational_response,
+    IntentClassification,
+    IntentType,
 )
+from app.services.emotion_detection_service import detect_emotion, is_emotional_conversation
+from app.services.emotion_state_service import choose_emotion, normalize_response_emotion
 from app.services.conversation_resolution_service import resolve_follow_up
 from app.services.voice_response_templates import localized_voice_message
 from app.services.performance_service import measure, performance_context
 from app.services.observability.langsmith_service import observed
+from app.services.llm_service import get_llm
+from app.services.language_registry import LANGUAGE_NAMES
+
+logger = logging.getLogger(__name__)
 
 
 def classify_question(confidence: str) -> str:
@@ -40,7 +50,14 @@ def classify_question(confidence: str) -> str:
 
 
 def _retrieval_diagnostics(retrieval_output: dict) -> dict:
-    return {
+    chunks = retrieval_output.get("retrieved_chunks") or []
+    diagnostics = {
+        "document_id": retrieval_output.get("document_id") or next((chunk.get("doc_id") for chunk in chunks if chunk.get("doc_id")), None),
+        "retrieved_chunk_count": len(chunks),
+        "retrieved_chunk_languages": sorted({chunk.get("language") for chunk in chunks if chunk.get("language")}),
+        "retrieved_pages": sorted({chunk.get("page_number") for chunk in chunks if chunk.get("page_number") is not None}),
+    }
+    diagnostics.update({
         key: retrieval_output.get(key)
         for key in (
             "dense_candidate_count",
@@ -51,7 +68,8 @@ def _retrieval_diagnostics(retrieval_output: dict) -> dict:
             "reranker_enabled",
             "reranker_status",
         )
-    }
+    })
+    return diagnostics
 
 
 def _unanswerable_response(
@@ -61,7 +79,15 @@ def _unanswerable_response(
     confidence: str | None = None,
     response_language: str = "en",
     message: str | None = None,
+    selected_emotion: str | None = None,
+    detected_emotion: str | None = None,
 ) -> dict:
+    emotion_state = choose_emotion(
+        intent="DOCUMENT_QUERY",
+        evidence_count=0,
+        selected_emotion=selected_emotion,
+        settings=None,
+    )
     return {
         "status": "error",
         "active_document": retrieval_output["active_document"],
@@ -74,6 +100,10 @@ def _unanswerable_response(
         "evidence": [],
         "retrieved_chunks": [],
         "message": message or localized_voice_message(response_language, "not_found"),
+        "emotion_state": emotion_state.as_dict(),
+        "detected_emotion": detected_emotion,
+        "response_emotion": emotion_state.emotion,
+        "response_tone": emotion_state.delivery,
         **_retrieval_diagnostics(retrieval_output),
     }
 
@@ -124,6 +154,27 @@ def _response_question_type(intent_name: str) -> str:
 def _needs_semantic_intent(intent) -> bool:
     """Use the LLM only for ambiguous or low-confidence local routes."""
     return intent.intent.value in {"DOCUMENT_QUERY", "AMBIGUOUS_QUERY"} or intent.confidence < 0.80
+
+
+def _translate_query_for_retrieval(question: str, source_language: str, api_key: str) -> str | None:
+    """Translate only a retrieval copy; the user's original question is retained."""
+    if not source_language or source_language not in LANGUAGE_NAMES or not question.strip():
+        return None
+    prompt = (
+        "Translate the following user question into {language} for document retrieval. "
+        "Return only the translated question, with no explanation. Preserve names, numbers, "
+        "page references, and quoted terms. Do not answer it.\n\nQuestion:\n{question}"
+    ).format(language=LANGUAGE_NAMES[source_language], question=question.strip())
+    try:
+        response = get_llm(api_key).invoke(prompt)
+        content = getattr(response, "content", "")
+        if isinstance(content, list):
+            content = "".join(block.get("text", "") for block in content if isinstance(block, dict))
+        translated = re.sub(r"^```(?:text)?\s*|\s*```$", "", str(content).strip(), flags=re.IGNORECASE).strip()
+        return translated if translated and translated.lower() != question.strip().lower() else None
+    except Exception:
+        # Retrieval must remain available when the optional fallback provider fails.
+        return None
 
 
 def _last_assistant_answer(context: str | None) -> str | None:
@@ -191,12 +242,13 @@ def _intent_response(request: QueryRequest, intent, *, endpoint: str, conversati
                 else localized_text_message(request.response_language, "conversation")
             ),
         }
-    if intent_name in {"GENERAL_CONVERSATION", "CASUAL_CONVERSATION"}:
+    if intent_name in {"GENERAL_CONVERSATION", "CASUAL_CONVERSATION", "GENERAL_INFORMATION"}:
+        response_question_type = "GENERAL_CONVERSATION" if endpoint == "/api/voice" and intent_name == "CASUAL_CONVERSATION" else intent_name
         return {
             "status": "success",
             "active_document": None,
             "question": request.question,
-            "question_type": "GENERAL_CONVERSATION",
+            "question_type": response_question_type,
             "answer": conversational_answer or localized_voice_message(request.response_language, "small_talk"),
             "confidence": None, "best_score": None, "average_score": None,
             "evidence": [], "retrieved_chunks": [], "evaluation": None,
@@ -229,7 +281,7 @@ def _intent_response(request: QueryRequest, intent, *, endpoint: str, conversati
             "evidence": [], "retrieved_chunks": [], "evaluation": None,
             "message": "Conversational response generated.",
         }
-    if intent_name in {"CLARIFY_RESPONSE", "AMBIGUOUS_QUERY"}:
+    if intent_name in {"CLARIFY_RESPONSE", "DOCUMENT_CLARIFICATION", "AMBIGUOUS_QUERY"}:
         return {
             "status": "clarification_required", "active_document": None, "question": request.question,
             "question_type": intent_name, "answer": None,
@@ -237,7 +289,7 @@ def _intent_response(request: QueryRequest, intent, *, endpoint: str, conversati
             "evidence": [], "retrieved_chunks": [], "evaluation": None,
             "message": _clarification_message(request.response_language),
         }
-    if intent.intent.value == "OUT_OF_SCOPE":
+    if intent.intent.value in {"OUT_OF_SCOPE", "GENERAL_KNOWLEDGE", "CURRENT_INFORMATION", "UNRELATED_CONVERSATION"}:
         return {
             "status": "out_of_scope",
             "active_document": None,
@@ -371,7 +423,25 @@ def run_document_query(
         classify_kwargs["conversation_context"] = request.conversation_context
     if "response_language" in classify_parameters:
         classify_kwargs["response_language"] = request.response_language
-    intent = classify(request.question, **classify_kwargs)
+    with measure("qa.intent_classification"):
+        intent = classify(request.question, **classify_kwargs)
+    emotion = detect_emotion(request.question) if endpoint == "/api/voice" else None
+    if emotion is not None:
+        request.detected_emotion = emotion.emotion
+        request.emotion_confidence = emotion.confidence
+        request.response_tone = emotion.response_tone
+        if is_emotional_conversation(request.question):
+            intent = IntentClassification(
+                intent=IntentType.GENERAL_CONVERSATION,
+                confidence=emotion.confidence,
+                requires_retrieval=False,
+                retrieval_strategy="NONE",
+                requires_evaluation=False,
+                response_action="RESPOND_CONVERSATIONALLY",
+                response_language=request.response_language,
+            )
+    if normalize_response_emotion(request.selected_emotion) != "AUTO":
+        request.response_tone = choose_emotion(selected_emotion=request.selected_emotion).delivery
     semantic_intent_enabled = bool(request.use_semantic_intent and endpoint == "/api/voice")
 
     # Classify before checking document availability. Voice conversation and
@@ -380,25 +450,51 @@ def run_document_query(
         active_document = get_active(current_user.id)
         if not active_document:
             if semantic_intent_enabled and intent.requires_retrieval and _needs_semantic_intent(intent):
-                semantic = classify_intent_semantically(
-                    request.question,
-                    api_key=os.getenv("OPENAI_API_KEY", ""),
-                    conversation_context=request.conversation_context,
-                    response_language=request.response_language,
-                )
+                with measure("qa.semantic_intent_classification"):
+                    semantic = classify_intent_semantically(
+                        request.question,
+                        api_key=os.getenv("OPENAI_API_KEY", ""),
+                        conversation_context=request.conversation_context,
+                        response_language=request.response_language,
+                    )
                 if semantic is not None:
                     intent = semantic
             conversational_answer = None
-            if intent.intent.value in {"CASUAL_CONVERSATION", "GENERAL_CONVERSATION"}:
+            if intent.intent.value in {"CASUAL_CONVERSATION", "GENERAL_CONVERSATION", "GENERAL_INFORMATION"}:
                 conversational_answer = generate_conversational_response(
                     request.question,
                     api_key=os.getenv("OPENAI_API_KEY", ""),
                     conversation_context=request.conversation_context,
                     response_language=request.response_language,
+                    response_tone=request.response_tone,
                 )
             return _no_document_voice_response(request, intent, conversational_answer=conversational_answer)
         if not intent.requires_retrieval:
-            return _intent_response(request, intent, endpoint=endpoint)
+            # A loaded PDF does not grant the voice agent general-knowledge
+            # capability. Keep limited conversation controls available, but
+            # route explicit external/general-information requests through
+            # the localized document-only refusal.
+            if intent.intent.value in {"GENERAL_INFORMATION", "GENERAL_KNOWLEDGE", "CURRENT_INFORMATION", "UNRELATED_CONVERSATION", "OUT_OF_SCOPE"}:
+                refusal = IntentClassification(
+                    intent=IntentType.OUT_OF_SCOPE,
+                    confidence=intent.confidence,
+                    requires_retrieval=False,
+                    retrieval_strategy="NONE",
+                    requires_evaluation=False,
+                    response_action="RESPOND_OUT_OF_SCOPE",
+                    response_language=request.response_language,
+                )
+                return _intent_response(request, refusal, endpoint=endpoint)
+            conversational_answer = None
+            if intent.intent.value in {"CASUAL_CONVERSATION", "GENERAL_CONVERSATION", "GENERAL_INFORMATION"}:
+                conversational_answer = generate_conversational_response(
+                    request.question,
+                    api_key=os.getenv("OPENAI_API_KEY", ""),
+                    conversation_context=request.conversation_context,
+                    response_language=request.response_language,
+                    response_tone=request.response_tone,
+                )
+            return _intent_response(request, intent, endpoint=endpoint, conversational_answer=conversational_answer)
 
     api_key = resolve_api_key(
         user=current_user,
@@ -407,13 +503,14 @@ def run_document_query(
     )
 
     if semantic_intent_enabled and intent.requires_retrieval and _needs_semantic_intent(intent):
-        semantic = classify_intent_semantically(
-            request.question,
-            api_key=api_key,
-            conversation_context=request.conversation_context,
-            active_document_id=(get_active(current_user.id) or {}).get("active_doc_id"),
-            response_language=request.response_language,
-        )
+        with measure("qa.semantic_intent_classification"):
+            semantic = classify_intent_semantically(
+                request.question,
+                api_key=api_key,
+                conversation_context=request.conversation_context,
+                active_document_id=(get_active(current_user.id) or {}).get("active_doc_id"),
+                response_language=request.response_language,
+            )
         if semantic is not None:
             intent = semantic
 
@@ -444,12 +541,13 @@ def run_document_query(
     # after the existing semantic security guardrail has allowed it.
     if endpoint == "/api/voice" and not intent.requires_retrieval:
         conversational_answer = None
-        if intent.intent.value in {"CASUAL_CONVERSATION", "GENERAL_CONVERSATION"} and semantic_intent_enabled:
+        if intent.intent.value in {"CASUAL_CONVERSATION", "GENERAL_CONVERSATION", "GENERAL_INFORMATION"} and semantic_intent_enabled:
             conversational_answer = generate_conversational_response(
                 request.question,
                 api_key=api_key,
                 conversation_context=request.conversation_context,
                 response_language=request.response_language,
+                response_tone=request.response_tone,
             )
         return _intent_response(request, intent, endpoint=endpoint, conversational_answer=conversational_answer)
 
@@ -458,6 +556,7 @@ def run_document_query(
 
     with measure("qa.query_preprocessing"):
         query_text = request.question
+        retrieval_language = "original_document"
         resolved_pages: tuple[int, ...] = ()
         if intent.intent.value == "DOCUMENT_FOLLOWUP":
             resolved = resolve_follow_up(request.question, request.conversation_context)
@@ -465,12 +564,10 @@ def run_document_query(
                 return _intent_response(request, intent, endpoint=endpoint)
             query_text = resolved.query
             resolved_pages = resolved.page_numbers
-        elif request.conversation_context:
-            query_text = (
-                "Conversation context:\n"
-                f"{request.conversation_context}\n\n"
-                f"Current user question:\n{request.question}"
-            )
+        # Conversation context is retained for intent classification and
+        # follow-up/page resolution, but standalone document retrieval must
+        # receive only the current question. Historical answers can otherwise
+        # dominate BM25/RRF and contaminate the active-document query.
 
     active_doc = get_active(current_user.id)
     active_doc_id = active_doc["active_doc_id"] if active_doc else None
@@ -491,6 +588,68 @@ def run_document_query(
         with performance_context(**timing_fields):
             with measure("qa.retrieval_pipeline"):
                 retrieval_output = retrieve(query_text, user_id=current_user.id)
+    # Multilingual E5 is the primary cross-lingual path. If it produces no
+    # usable result for a different-script query, retry retrieval with a
+    # controlled translation copy while preserving the original question for
+    # intent, answer generation, citations, and persistence.
+    if not (intent.intent.value == "PAGE_QUERY" or resolved_pages):
+        source_language = (active_doc or {}).get("evidence_language") or (active_doc or {}).get("input_language")
+        query_language = request.query_language
+        suggestion = request.suggestion_provenance if isinstance(request.suggestion_provenance, dict) else None
+        suggested_ids = {
+            int(value) for value in (suggestion or {}).get("supporting_chunk_ids", [])
+            if isinstance(value, int) or (isinstance(value, str) and value.isdigit())
+        }
+        suggestion_matches_document = bool(
+            suggestion
+            and suggestion.get("document_id") == (active_doc or {}).get("active_doc_id")
+            and suggestion.get("answerability") in {None, "validated"}
+            and suggested_ids
+        )
+        retrieved_ids = {
+            int(chunk.get("chunk_id")) for chunk in retrieval_output.get("retrieved_chunks", [])
+            if chunk.get("chunk_id") is not None
+        }
+        provenance_miss = suggestion_matches_document and not retrieved_ids.intersection(suggested_ids)
+        logger.info(
+            "suggestion retrieval continuity: present=%s document_match=%s supporting_chunk_count=%d retrieved_chunk_count=%d provenance_overlap=%s",
+            bool(suggestion), suggestion_matches_document, len(suggested_ids), len(retrieved_ids),
+            bool(retrieved_ids.intersection(suggested_ids)),
+        )
+        primary_unusable = (
+            retrieval_output.get("status") != "success"
+            or retrieval_output.get("confidence") == "low"
+            or provenance_miss
+        )
+        # A validated suggested question already has source-chunk provenance.
+        # Always add a source-language retrieval copy for that case so a
+        # successful but incomplete English dense/BM25 result cannot hide the
+        # cited Malayalam/Kannada/etc. chunk. Ordinary questions retain the
+        # existing fallback-only behavior.
+        needs_translation_variant = primary_unusable or suggestion_matches_document
+        if needs_translation_variant and source_language and query_language and query_language != source_language and query_language != "mixed":
+            translated_query = _translate_query_for_retrieval(query_text, source_language, api_key)
+            if translated_query:
+                with performance_context(**timing_fields):
+                    with measure("qa.cross_lingual_translation_retrieval"):
+                        retrieve_parameters = inspect.signature(retrieve).parameters
+                        if "query_variants" in retrieve_parameters or any(
+                            parameter.kind is inspect.Parameter.VAR_KEYWORD
+                            for parameter in retrieve_parameters.values()
+                        ):
+                            translated_output = retrieve(
+                                query_text, user_id=current_user.id,
+                                query_variants=[translated_query],
+                            )
+                        else:
+                            translated_output = retrieve(translated_query, user_id=current_user.id)
+                if translated_output.get("status") == "success" and translated_output.get("confidence") != "low":
+                    translated_output["retrieval_strategy"] = "translated_fallback"
+                    translated_output["original_query_language"] = query_language
+                    translated_output["retrieval_query_language"] = source_language
+                    retrieval_output = translated_output
+                    retrieval_language = source_language
+
     if retrieval_output["status"] != "success":
         page_error_message = None
         if retrieval_output.get("invalid_pages") and retrieval_output.get("total_pages"):
@@ -503,6 +662,8 @@ def run_document_query(
             return _unanswerable_response(
                 retrieval_output, request.question,
                 response_language=request.response_language,
+                selected_emotion=request.selected_emotion,
+                detected_emotion=request.detected_emotion,
                 message=page_error_message,
             )
         if request.response_language != "en":
@@ -521,6 +682,8 @@ def run_document_query(
         return _unanswerable_response(
             retrieval_output, request.question,
             response_language=request.response_language,
+            selected_emotion=request.selected_emotion,
+            detected_emotion=request.detected_emotion,
         )
 
     retrieved_chunks = retrieval_output["retrieved_chunks"]
@@ -540,8 +703,24 @@ def run_document_query(
     )
     if accepts_kwargs or "response_language" in answer_parameters:
         answer_kwargs["response_language"] = request.response_language
+    if accepts_kwargs or "response_length" in answer_parameters:
+        answer_kwargs["response_length"] = request.response_length
     if accepts_kwargs or "conversation_context" in answer_parameters:
         answer_kwargs["conversation_context"] = request.conversation_context
+    if accepts_kwargs or "response_tone" in answer_parameters:
+        answer_kwargs["response_tone"] = request.response_tone
+    optional_language_args = {
+        "original_question": request.question,
+        "query_language": request.query_language,
+        "document_language": (active_doc or {}).get("evidence_language") or (active_doc or {}).get("input_language"),
+        "retrieval_language": retrieval_language,
+        "detected_emotion": request.detected_emotion,
+        "emotion_confidence": request.emotion_confidence,
+        "response_tone": request.response_tone,
+    }
+    for name, value in optional_language_args.items():
+        if accepts_kwargs or name in answer_parameters:
+            answer_kwargs[name] = value
     with performance_context(**timing_fields):
         with measure("qa.answer_generation"):
             final_answer = generate_answer(**answer_kwargs)
@@ -551,6 +730,8 @@ def run_document_query(
             request.question,
             confidence="low",
             response_language=request.response_language,
+            selected_emotion=request.selected_emotion,
+            detected_emotion=request.detected_emotion,
         )
     if endpoint != "/api/voice" and not is_language_supported_text(
         final_answer, request.response_language
@@ -563,6 +744,8 @@ def run_document_query(
             request.question,
             confidence="low",
             response_language=request.response_language,
+            selected_emotion=request.selected_emotion,
+            detected_emotion=request.detected_emotion,
         )
 
     with measure("qa.citation_construction"):
@@ -635,9 +818,17 @@ def run_document_query(
             else localized_text_message(request.response_language, "unknown")
         )
 
+    emotion_state = choose_emotion(
+        intent=response_question_type,
+        evidence_count=len(evidence),
+        confidence=getattr(evaluation, "overall_confidence", None),
+        selected_emotion=request.selected_emotion,
+    )
+
     return {
         "status": response_status,
         "active_document": retrieval_output["active_document"],
+        "document_id": active_doc_id,
         "question": request.question,
         "question_type": response_question_type,
         "answer": response_answer,
@@ -648,5 +839,15 @@ def run_document_query(
         "retrieved_chunks": retrieved_chunks,
         "evaluation": evaluation.model_dump(),
         "message": response_message,
+        "document_language": (active_doc or {}).get("evidence_language") or (active_doc or {}).get("input_language"),
+        "query_language": request.query_language,
+        "retrieval_language": retrieval_language,
+        "response_language": request.response_language,
+        "emotion_state": emotion_state.as_dict(),
+        "detected_emotion": request.detected_emotion,
+        "response_emotion": emotion_state.emotion,
+        "response_tone": emotion_state.delivery,
+        "retrieval_strategy": retrieval_output.get("retrieval_strategy", "direct_multilingual"),
+        "retrieval_query_language": retrieval_output.get("retrieval_query_language", request.query_language),
         **_retrieval_diagnostics(retrieval_output),
     }

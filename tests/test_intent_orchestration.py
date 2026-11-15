@@ -5,7 +5,9 @@ import pytest
 from app.models.evaluation_models import EvaluationDecision
 from app.models.query_models import QueryRequest
 from app.models.security_models import SecurityCheckResult, SecurityDecision
+from app.services import rag_orchestration_service
 from app.services.rag_orchestration_service import run_document_query
+from app.services.voice_intent_service import IntentClassification, IntentType
 
 
 def _dependencies(captured):
@@ -107,6 +109,23 @@ def test_general_conversation_with_pdf_never_invokes_judge_or_retrieval():
     assert "hybrid" not in captured and "pages" not in captured and "evaluation" not in captured
 
 
+def test_general_information_with_pdf_is_refused_without_retrieval():
+    captured = {}
+    dependencies = _dependencies(captured)
+    dependencies["classify_intent"] = lambda *_args, **_kwargs: IntentClassification(
+        IntentType.GENERAL_INFORMATION, 0.99, (), False, "NONE", False,
+        response_action="RESPOND_CONVERSATIONALLY", response_language="hi",
+    )
+    result = run_document_query(
+        QueryRequest(question="What is today's weather?", response_language="hi"),
+        SimpleNamespace(id=7), endpoint="/api/voice", dependencies=dependencies,
+    )
+    assert result["status"] == "out_of_scope"
+    assert result["question_type"] == "OUT_OF_SCOPE"
+    assert result["answer"] is None
+    assert "hybrid" not in captured and "pages" not in captured
+
+
 def test_application_help_with_pdf_bypasses_retrieval():
     captured = {}
     result = run_document_query(
@@ -205,6 +224,114 @@ def test_normal_document_query_keeps_existing_hybrid_pipeline():
     assert result["status"] == "success"
     assert captured["hybrid"] == [("What does the document say?", 7)]
     assert "pages" not in captured
+
+
+def test_standalone_document_query_does_not_embed_conversation_history():
+    captured = {}
+    result = run_document_query(
+        QueryRequest(
+            question="What is the publication date?",
+            conversation_context="User: Tell me about another section.\nAssistant: unrelated prior answer",
+            response_language="en",
+        ),
+        SimpleNamespace(id=7), dependencies=_dependencies(captured),
+    )
+    assert result["status"] == "success"
+    assert captured["hybrid"] == [("What is the publication date?", 7)]
+
+
+def test_cross_lingual_translation_copy_targets_document_language(monkeypatch):
+    class FakeLLM:
+        def invoke(self, _prompt):
+            return SimpleNamespace(content="മലയാളം പരിഭാഷ")
+
+    captured = {}
+    monkeypatch.setattr(rag_orchestration_service, "get_llm", lambda _api_key: FakeLLM())
+    original = "یہ دستاویز کس بارے میں ہے؟"
+    translated = rag_orchestration_service._translate_query_for_retrieval(original, "ml", "test-key")
+
+    assert translated == "മലയാളം പരിഭാഷ"
+    assert original != translated
+
+
+def test_validated_suggestion_miss_triggers_normal_translation_fallback(monkeypatch):
+    captured = {}
+    dependencies = _dependencies(captured)
+    base_retrieve = dependencies["retrieve_relevant_chunks"]
+    calls = []
+
+    def retrieve(query, user_id):
+        calls.append(query)
+        result = base_retrieve(query, user_id)
+        if len(calls) == 1:
+            result = {**result, "retrieved_chunks": [{**result["retrieved_chunks"][0], "chunk_id": 99}]}
+        return result
+
+    dependencies["retrieve_relevant_chunks"] = retrieve
+    dependencies["get_active_document"] = lambda _user_id: {
+        "active_doc_id": "ml-doc", "active_filename": "source.pdf", "evidence_language": "ml",
+    }
+    dependencies["classify_intent"] = lambda *_args, **_kwargs: IntentClassification(
+        IntentType.DOCUMENT_QUERY, 1.0, (), True, "RUN_DOCUMENT_QUERY",
+    )
+    monkeypatch.setattr(rag_orchestration_service, "_translate_query_for_retrieval", lambda *_args: "മലയാളം ചോദ്യം")
+    result = run_document_query(
+        QueryRequest(
+            question="What is this document about?", response_language="en",
+            suggestion_provenance={
+                "question": "What is this document about?", "document_id": "ml-doc",
+                "answerability": "validated", "supporting_chunk_ids": [10],
+            },
+        ),
+        SimpleNamespace(id=7), dependencies=dependencies,
+    )
+    assert result["status"] == "success"
+    assert calls == ["What is this document about?", "മലയാളം ചോദ്യം"]
+    assert result["retrieval_query_language"] == "ml"
+
+
+def test_validated_cross_language_suggestion_always_adds_translation_variant(monkeypatch):
+    captured = {}
+    dependencies = _dependencies(captured)
+    calls = []
+
+    def retrieve(query, user_id, query_variants=None):
+        calls.append((query, query_variants or []))
+        return {
+            "status": "success", "active_document": "source.pdf", "confidence": "high",
+            "best_score": 0.8, "average_score": 0.8,
+            "retrieved_chunks": [{
+                "chunk_id": 10, "file_name": "source.pdf", "page_number": 2,
+                "text": "മലയാളം രേഖയിലെ ഉത്തരം", "score": 0.8,
+            }],
+        }
+
+    dependencies["retrieve_relevant_chunks"] = retrieve
+    dependencies["get_active_document"] = lambda _user_id: {
+        "active_doc_id": "ml-doc", "active_filename": "source.pdf", "evidence_language": "ml",
+    }
+    dependencies["classify_intent"] = lambda *_args, **_kwargs: IntentClassification(
+        IntentType.DOCUMENT_QUERY, 1.0, (), True, "RUN_DOCUMENT_QUERY",
+    )
+    monkeypatch.setattr(rag_orchestration_service, "_translate_query_for_retrieval", lambda *_args: "മലയാളം ചോദ്യം")
+
+    result = run_document_query(
+        QueryRequest(
+            question="What is the answer?", response_language="en",
+            suggestion_provenance={
+                "document_id": "ml-doc", "answerability": "validated",
+                "supporting_chunk_ids": [10],
+            },
+        ),
+        SimpleNamespace(id=7), dependencies=dependencies,
+    )
+
+    assert result["status"] == "success"
+    assert calls == [
+        ("What is the answer?", []),
+        ("What is the answer?", ["മലയാളം ചോദ്യം"]),
+    ]
+    assert result["retrieval_query_language"] == "ml"
 
 
 @pytest.mark.parametrize(

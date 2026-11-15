@@ -39,6 +39,8 @@ def save_active_document(
     evidence_language: str | None = None,
     response_language: str | None = None,
     total_pages: int | None = None,
+    source_path: str | None = None,
+    sha256: str | None = None,
 ):
     """
     Atomically save the active document registry.
@@ -66,6 +68,8 @@ def save_active_document(
         ("evidence_language", evidence_language),
         ("response_language", response_language),
         ("total_pages", total_pages),
+        ("source_path", source_path),
+        ("sha256", sha256),
     ):
         if value is not None:
             data[key] = value
@@ -121,7 +125,41 @@ def update_document_languages(
         input_language=input_language if input_language is not None else active.get("input_language"),
         evidence_language=evidence_language if evidence_language is not None else active.get("evidence_language"),
         response_language=response_language if response_language is not None else active.get("response_language"),
+        source_path=active.get("source_path"),
+        sha256=active.get("sha256"),
     )
+
+
+def document_artifacts_available(document: dict | None, user_id: int) -> tuple[bool, str]:
+    """Verify that a saved document can be made active for retrieval."""
+    if not document or not document.get("active_doc_id") or not document.get("active_filename"):
+        return False, "The saved conversation has no document identity."
+    source_path = document.get("source_path")
+    if source_path and not Path(source_path).is_file():
+        return False, "The original PDF is unavailable."
+    from app.services.vector_store_service import document_vectorstore_available, document_vectorstore_matches_identity
+    if not document_vectorstore_available(user_id, document["active_doc_id"]):
+        return False, "The retrieval index for this PDF is unavailable."
+    if not document_vectorstore_matches_identity(user_id, document["active_doc_id"], document["active_filename"]):
+        return False, "The retrieval index metadata does not match this PDF. Re-upload the original document to rebuild it safely."
+    return True, ""
+
+
+def activate_document(document: dict, user_id: int) -> tuple[bool, str]:
+    """Atomically make a historical document the user's active document."""
+    available, reason = document_artifacts_available(document, user_id)
+    if not available:
+        return False, reason
+    save_active_document(
+        document["active_doc_id"], document["active_filename"], user_id=user_id,
+        input_language=document.get("input_language"),
+        evidence_language=document.get("evidence_language"),
+        response_language=document.get("response_language"),
+        total_pages=document.get("total_pages"),
+        source_path=document.get("source_path"),
+        sha256=document.get("sha256"),
+    )
+    return True, ""
 
 
 def get_active_document(

@@ -7,6 +7,7 @@ python-multipart
 requests
 httpx
 websockets
+gnani-vachana>=0.9.0
 
 openai
 

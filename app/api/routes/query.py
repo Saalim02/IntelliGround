@@ -1,6 +1,7 @@
 
 import json
 import threading
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, HTTPException, Depends
 from sqlalchemy.orm import Session
@@ -18,6 +19,7 @@ from app.models.conversation_models import ConversationTurn
 from app.core.database import get_db
 
 from app.services.evaluation.evaluation_storage_service import (
+    list_evaluations,
     save_evaluation,
     load_evaluation,
     save_human_review,
@@ -25,7 +27,7 @@ from app.services.evaluation.evaluation_storage_service import (
     save_user_feedback,
 )
 from app.services.answer_service import generate_grounded_answer
-from app.services.document_registry_service import get_active_document
+from app.services.document_registry_service import document_artifacts_available, get_active_document
 from app.services.evaluation.evaluation_service import evaluate_rag_response
 from app.services.retrieval_service import retrieve_relevant_chunks
 from app.services.security.guardrails import validate_question
@@ -51,6 +53,16 @@ _evaluation_lock = threading.Lock()
 _evaluations_in_progress: set[tuple[int, int]] = set()
 
 
+@router.get("/evaluation")
+def list_user_evaluations(
+    current_user: User = Depends(get_current_user),
+):
+    """Return the authenticated user's evaluation history only."""
+    return {
+        "evaluations": [item.model_dump(mode="json") for item in list_evaluations(current_user.id)],
+    }
+
+
 @router.post(
     "/ask",
     response_model=QueryResponse,
@@ -65,18 +77,22 @@ def ask_question(
     if request.conversation_id:
         conversation = get_owned_conversation(db, current_user, request.conversation_id)
         validate_conversation_document(conversation, active_document)
+        available, reason = document_artifacts_available(active_document, current_user.id)
+        if not available:
+            raise HTTPException(status_code=409, detail={
+                "code": "DOCUMENT_UNAVAILABLE",
+                "message": f"This conversation cannot be answered safely: {reason}",
+                "reason": reason,
+                "conversation_id": conversation.id,
+                "document_id": conversation.document_id,
+                "recoverable": True,
+            })
+        conversation.response_language = request.response_language or conversation.response_language
+        conversation.response_length = request.response_length
+        db.add(conversation)
+        db.commit()
         # Client-supplied context is never trusted for persisted conversations.
         request.conversation_context = recent_context(db, conversation) or None
-    elif active_document and active_document.get("active_doc_id") and active_document.get("active_filename"):
-        conversation = create_conversation(
-            db,
-            current_user,
-            document=active_document,
-            mode="text",
-            response_language=request.response_language or active_document.get("response_language") or "en",
-            speech_input_language=None,
-            speech_output_language=None,
-        )
 
     result = run_document_query(
         request,
@@ -95,6 +111,20 @@ def ask_question(
             "save_evaluation": save_evaluation,
         },
     )
+    # Do not create a history row until the query has produced a usable
+    # result. This keeps failed/aborted requests from leaving empty chats.
+    if conversation is None and active_document and active_document.get("active_doc_id") and active_document.get("active_filename"):
+        conversation = create_conversation(
+            db,
+            current_user,
+            document=active_document,
+            mode="text",
+            response_language=request.response_language or active_document.get("response_language") or "en",
+            response_length=request.response_length,
+            title=(request.question or active_document.get("active_filename") or "New conversation")[:512],
+            speech_input_language=None,
+            speech_output_language=None,
+        )
     if conversation is not None:
         turn_id = request.turn_id or None
         add_turn_if_new(
@@ -126,6 +156,16 @@ def ask_question(
             )
             if assistant_turn is not None:
                 result["answer_id"] = assistant_turn.id
+                evaluation_id = (result.get("evaluation") or {}).get("evaluation_id")
+                if evaluation_id:
+                    evaluation = load_evaluation(evaluation_id, user_id=current_user.id)
+                    if evaluation:
+                        evaluation.document_id = conversation.document_id
+                        evaluation.document_name = conversation.document_name
+                        evaluation.conversation_id = conversation.id
+                        evaluation.answer_id = assistant_turn.id
+                        evaluation.created_at = evaluation.created_at or datetime.now(timezone.utc)
+                        save_evaluation(evaluation, user_id=current_user.id)
         result["conversation_id"] = conversation.id
     else:
         result.setdefault("conversation_id", None)

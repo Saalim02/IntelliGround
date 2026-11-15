@@ -1,6 +1,7 @@
 from fastapi.testclient import TestClient
 
 from app.main import app
+from app.services import pdf_service
 
 client = TestClient(app)
 
@@ -47,37 +48,26 @@ def auth_form_data():
     }
 
 
-def test_upload_pdf_exceeding_page_limit_is_blocked(monkeypatch):
+def test_pdf_page_count_is_not_rejected_by_an_arbitrary_cap(monkeypatch):
     class FakeDocument:
         def __len__(self):
             return 1401
+
+        def __iter__(self):
+            return iter([])
 
         def close(self):
             pass
 
     monkeypatch.setattr(
-        "app.services.pdf_service.fitz.open",
+        pdf_service.fitz,
+        "open",
         lambda _: FakeDocument(),
     )
 
-    response = client.post(
-        "/api/upload-pdf",
-        headers=auth_headers(),
-        data=auth_form_data(),
-        files={
-            "file": (
-                "large.pdf",
-                b"fake-pdf-content",
-                "application/pdf",
-            )
-        },
-    )
+    result = pdf_service.extract_text_from_pdf("large.pdf")
 
-    assert response.status_code == 400
-    assert (
-        "maximum allowed page count of 1400 pages"
-        in response.json()["detail"]
-    )
+    assert result["total_pages"] == 1401
 
 
 def test_upload_malformed_pdf_is_rejected_and_cleaned_up(

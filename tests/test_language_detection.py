@@ -1,5 +1,5 @@
 
-from app.services.language_detection_service import detect_text_language, detect_voice_response_language
+from app.services.language_detection_service import detect_text_language, detect_voice_language, detect_voice_response_language
 
 
 def test_detects_kannada_script():
@@ -64,6 +64,17 @@ def test_voice_language_switches_on_dominant_new_language():
         "This is a complete English sentence asking about the document.",
         "hi",
     ) == "en"
+
+
+def test_provider_language_metadata_is_authoritative_for_each_turn():
+    result = detect_voice_language("short transcript", "kn", provider_language="te-IN")
+    assert result == {"language": "te", "confidence": 1.0, "source": "prisma"}
+
+
+def test_low_confidence_turn_keeps_previous_voice_language():
+    result = detect_voice_language("API 123", "kn")
+    assert result["language"] == "kn"
+    assert result["source"] == "fallback"
 
 
 def test_urdu_detection_is_preserved_but_provider_capability_remains_explicit():

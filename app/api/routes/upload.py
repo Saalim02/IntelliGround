@@ -1,6 +1,8 @@
 import asyncio
+import hashlib
 import logging
 import uuid
+from pathlib import Path
 
 from fastapi import (
     APIRouter,
@@ -10,10 +12,13 @@ from fastapi import (
     HTTPException,
     Depends,
 )
+from sqlalchemy.orm import Session
 
 from app.services.validation_service import validate_pdf_file
 
 from app.models.auth_models import User
+from app.core.database import get_db
+from app.services.conversation_service import get_owned_conversation, validate_document_reupload
 from app.services.security.auth_dependencies import get_current_user
 
 from app.services.document_cleanup_service import (
@@ -75,7 +80,10 @@ async def upload_pdf(
     file: UploadFile = File(...),
     language: str = Form(default="auto"),
     job_id: str = Form(default=""),
+    conversation_id: str = Form(default=""),
+    confirm_replacement: bool = Form(default=False),
     current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ):
     saved_path = None
     original_filename = None
@@ -84,6 +92,7 @@ async def upload_pdf(
     debug_transaction = None
     previous_registry = None
     registry_saved = False
+    restore_conversation = None
     try:
         job_id = normalize_job_id(job_id)
     except ValueError as exc:
@@ -106,6 +115,9 @@ async def upload_pdf(
                 ),
             )
 
+        if conversation_id:
+            restore_conversation = get_owned_conversation(db, current_user, conversation_id)
+
         # -----------------------------------
         # VALIDATE PDF
         # -----------------------------------
@@ -122,15 +134,47 @@ async def upload_pdf(
                 saved_path,
                 file_size_mb,
             ) = await save_uploaded_file(file, user_id=current_user.id)
+        document_sha256 = hashlib.sha256(Path(saved_path).read_bytes()).hexdigest()
+        if restore_conversation:
+            verified, reason = validate_document_reupload(
+                restore_conversation,
+                filename=original_filename,
+                sha256=document_sha256,
+                confirmed_replacement=confirm_replacement,
+            )
+            if not verified:
+                raise HTTPException(status_code=409, detail={
+                    "code": "DOCUMENT_IDENTITY_UNVERIFIED",
+                    "message": reason,
+                    "requires_confirmation": True,
+                })
 
         # -----------------------------------
         # EXTRACT PDF TEXT
         # -----------------------------------
         try:
             with measure("ingestion.extraction", job_id=job_id, document_id=doc_id, user_id=current_user.id):
-                pdf_data = await asyncio.to_thread(
-                    extract_text_from_pdf, saved_path, language_hint=language,
+                extraction_progress = lambda completed, total: update_job(
+                    current_user.id,
+                    job_id,
+                    10 + round(10 * completed / max(total, 1)),
+                    f"Extracting PDF pages ({completed}/{total})",
                 )
+                try:
+                    pdf_data = await asyncio.to_thread(
+                        extract_text_from_pdf,
+                        saved_path,
+                        language_hint=language,
+                        progress_callback=extraction_progress,
+                    )
+                except TypeError as exc:
+                    # Preserve compatibility with narrow test/integration
+                    # seams that still expose the older two-argument helper.
+                    if "progress_callback" not in str(exc):
+                        raise
+                    pdf_data = await asyncio.to_thread(
+                        extract_text_from_pdf, saved_path, language_hint=language,
+                    )
 
         except ValueError as exc:
             raise HTTPException(
@@ -148,6 +192,7 @@ async def upload_pdf(
         )
         with measure("ingestion.language_detection", job_id=job_id, document_id=doc_id, user_id=current_user.id):
             detected_evidence_language = detect_text_language(extracted_text)["language"]
+        update_job(current_user.id, job_id, 30, "Document language detected")
         if detected_evidence_language == "und":
             detected_evidence_language = {
                 "hin": "hi", "kan": "kn", "tam": "ta", "tel": "te",
@@ -195,8 +240,8 @@ async def upload_pdf(
         # -----------------------------------
         # DOCUMENT ID
         # -----------------------------------
-        doc_id = str(uuid.uuid4())
-        update_job(current_user.id, job_id, 22, "PDF text ready", document_id=doc_id)
+        doc_id = restore_conversation.document_id if restore_conversation else str(uuid.uuid4())
+        update_job(current_user.id, job_id, 30, "PDF text ready", document_id=doc_id)
 
         # -----------------------------------
         # GENERATE PAGE IMAGES
@@ -205,7 +250,7 @@ async def upload_pdf(
             await asyncio.to_thread(
                 generate_page_images, saved_path, doc_id, user_id=current_user.id,
                 progress_callback=lambda completed, total: update_job(
-                    current_user.id, job_id, 22 + round(13 * completed / total),
+                    current_user.id, job_id, 30 + round(10 * completed / total),
                     f"Processing page images ({completed}/{total})", document_id=doc_id,
                 ),
             )
@@ -217,7 +262,7 @@ async def upload_pdf(
             await asyncio.to_thread(
                 save_summary_source, doc_id, extracted_text, user_id=current_user.id,
             )
-        update_job(current_user.id, job_id, 38, "Document text persisted", document_id=doc_id)
+        update_job(current_user.id, job_id, 40, "Document text persisted", document_id=doc_id)
 
         # -----------------------------------
         # BUILD CHUNK METADATA
@@ -226,7 +271,7 @@ async def upload_pdf(
             metadata, chunk_configs = await asyncio.to_thread(
                 build_chunk_metadata, pages_data, original_filename, doc_id,
             )
-        update_job(current_user.id, job_id, 45, "Chunks created", document_id=doc_id)
+        update_job(current_user.id, job_id, 50, "Chunks created", document_id=doc_id)
 
         # -----------------------------------
         # CONVERT TO LANGCHAIN DOCUMENTS
@@ -236,7 +281,7 @@ async def upload_pdf(
             metadata,
             original_filename,
         )
-        update_job(current_user.id, job_id, 48, "Retrieval documents prepared", document_id=doc_id)
+        update_job(current_user.id, job_id, 55, "Retrieval documents prepared", document_id=doc_id)
 
         if not documents:
             raise HTTPException(
@@ -251,14 +296,31 @@ async def upload_pdf(
         # CREATE AND SAVE VECTOR STORE
         # -----------------------------------
         previous_registry = get_active_document(current_user.id)
+        # The detected PDF language is source metadata, not the response
+        # preference. Preserve the existing selector choice across uploads.
+        selected_response_language = (
+            previous_registry.get("response_language")
+            if previous_registry and previous_registry.get("response_language")
+            else "en"
+        )
         with measure("ingestion.embedding_and_index_build", job_id=job_id, document_id=doc_id, user_id=current_user.id):
             vectorstore_transaction = await asyncio.to_thread(
-                begin_vectorstore_transaction, documents, user_id=current_user.id,
+                begin_vectorstore_transaction,
+                documents,
+                user_id=current_user.id,
+                document_id=doc_id,
+                progress_callback=lambda completed, total: update_job(
+                    current_user.id,
+                    job_id,
+                    55 + round(10 * completed / max(total, 1)),
+                    f"Embedding chunks ({completed}/{total})",
+                    document_id=doc_id,
+                ),
             )
-        update_job(current_user.id, job_id, 75, "Embeddings and indexes created", document_id=doc_id)
+        update_job(current_user.id, job_id, 65, "Embeddings and indexes staged", document_id=doc_id)
         vectorstore_transaction.__enter__()
         vectorstore_transaction.install()
-        update_job(current_user.id, job_id, 80, "Vector and BM25 indexes installed", document_id=doc_id)
+        update_job(current_user.id, job_id, 80, "Dense and BM25 indexes installed", document_id=doc_id)
 
         # -----------------------------------
         # EXPORT DEBUG FILES
@@ -266,13 +328,13 @@ async def upload_pdf(
         with measure("ingestion.debug_metadata_export", job_id=job_id, document_id=doc_id, user_id=current_user.id):
             debug_transaction = await asyncio.to_thread(
                 export_debug_files, original_filename, pages_data, metadata,
-                user_id=current_user.id, commit=False,
+                user_id=current_user.id, document_id=doc_id, commit=False,
             )
 
         # Install both filesystem replacements before changing the registry.
         # Their backups remain available until every state change succeeds.
         debug_transaction.install()
-        update_job(current_user.id, job_id, 93, "Metadata and page-image processing completed", document_id=doc_id)
+        update_job(current_user.id, job_id, 90, "Indexes validated and metadata persisted", document_id=doc_id)
 
         # -----------------------------------
         # ACTIVE DOCUMENT REGISTRY
@@ -283,16 +345,24 @@ async def upload_pdf(
             user_id=current_user.id,
             input_language=language,
             evidence_language=detected_evidence_language,
-            response_language=(
-                "en" if language in {"auto", "eng"} else {
-                    "hin": "hi", "kan": "kn", "tam": "ta", "tel": "te",
-                    "mal": "ml", "mar": "mr", "guj": "gu", "ben": "bn",
-                    "pan": "pa", "urd": "ur",
-                }.get(language, "en")
-            ),
+            response_language=selected_response_language,
             total_pages=total_pages,
+            source_path=saved_path,
+            sha256=document_sha256,
         )
         registry_saved = True
+        if restore_conversation:
+            restore_conversation.document_path = saved_path
+            restore_conversation.document_sha256 = document_sha256
+            # Explicit replacement is allowed to change the historical
+            # document identity only after the user confirms it. Keep the
+            # conversation name aligned with the rebuilt index metadata.
+            restore_conversation.document_name = original_filename
+            restore_conversation.document_input_language = language
+            restore_conversation.document_evidence_language = detected_evidence_language
+            restore_conversation.document_total_pages = total_pages
+            db.add(restore_conversation)
+            db.commit()
         # Installation is reversible.  Keep both backups until the registry
         # and both filesystem replacements have been marked committed.
         vectorstore_transaction.mark_committed()
@@ -330,6 +400,7 @@ async def upload_pdf(
         # -----------------------------------
         return UploadPDFResponse(
             status="success",
+            active_doc_id=doc_id,
             filename=original_filename,
             saved_filename=saved_path.replace(
                 "\\",
@@ -348,13 +419,7 @@ async def upload_pdf(
             ),
             input_language=language,
             evidence_language=detected_evidence_language,
-            response_language=(
-                "en" if language in {"auto", "eng"} else {
-                    "hin": "hi", "kan": "kn", "tam": "ta", "tel": "te",
-                    "mal": "ml", "mar": "mr", "guj": "gu", "ben": "bn",
-                    "pan": "pa", "urd": "ur",
-                }.get(language, "en")
-            ),
+            response_language=selected_response_language,
             message=(
                 "PDF uploaded, extracted, chunked, "
                 "embedded, and stored successfully. "
@@ -380,6 +445,8 @@ async def upload_pdf(
                     evidence_language=previous_registry.get("evidence_language"),
                     response_language=previous_registry.get("response_language"),
                     total_pages=previous_registry.get("total_pages"),
+                    source_path=previous_registry.get("source_path"),
+                    sha256=previous_registry.get("sha256"),
                 )
             else:
                 clear_active_document(current_user.id)
@@ -411,6 +478,8 @@ async def upload_pdf(
                     evidence_language=previous_registry.get("evidence_language"),
                     response_language=previous_registry.get("response_language"),
                     total_pages=previous_registry.get("total_pages"),
+                    source_path=previous_registry.get("source_path"),
+                    sha256=previous_registry.get("sha256"),
                 )
             else:
                 clear_active_document(current_user.id)
@@ -436,5 +505,10 @@ def upload_progress(job_id: str, current_user: User = Depends(get_current_user))
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     progress = get_job(current_user.id, normalized)
     if progress is None:
-        raise HTTPException(status_code=404, detail="Upload job not found.")
+        raise HTTPException(status_code=404, detail={
+            "code": "UPLOAD_JOB_UNKNOWN",
+            "message": "Upload job is not available yet or has expired.",
+            "job_id": normalized,
+            "retryable": True,
+        })
     return progress

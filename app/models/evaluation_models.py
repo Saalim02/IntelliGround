@@ -1,4 +1,5 @@
 from enum import Enum
+from datetime import datetime
 from typing import List, Optional
 
 from pydantic import BaseModel, Field
@@ -85,6 +86,21 @@ class EvaluationResult(BaseModel):
         default_factory=list
     )
 
+    # Optional audit metadata. These fields are backward compatible with
+    # evaluations written before user-facing evaluation history existed.
+    document_id: Optional[str] = None
+    document_name: Optional[str] = None
+    conversation_id: Optional[str] = None
+    answer_id: Optional[int] = None
+    created_at: Optional[datetime] = None
+    provider: Optional[str] = None
+    model: Optional[str] = None
+    original_decision: Optional[EvaluationDecision] = None
+    original_answer: Optional[str] = None
+    corrected_answer: Optional[str] = None
+    reviewed_at: Optional[datetime] = None
+    reviewer_id: Optional[int] = None
+
 
 class HumanReview(BaseModel):
     evaluation_id: str
@@ -96,6 +112,10 @@ class HumanReview(BaseModel):
     feedback_text: Optional[str] = None
 
     corrected_answer: Optional[str] = None
+    reviewer_id: Optional[int] = None
+    reviewed_at: Optional[datetime] = None
+    original_decision: Optional[EvaluationDecision] = None
+    original_answer: Optional[str] = None
 
 
 class EvaluationFeedback(BaseModel):

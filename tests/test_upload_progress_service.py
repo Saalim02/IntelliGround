@@ -105,3 +105,9 @@ def test_upload_progress_route_returns_404_for_unknown_or_other_user_job(monkeyp
         upload_route.upload_progress(job_id, SimpleNamespace(id=99))
 
     assert exc_info.value.status_code == 404
+    assert exc_info.value.detail == {
+        "code": "UPLOAD_JOB_UNKNOWN",
+        "message": "Upload job is not available yet or has expired.",
+        "job_id": job_id,
+        "retryable": True,
+    }

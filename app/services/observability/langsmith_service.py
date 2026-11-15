@@ -12,6 +12,7 @@ import logging
 import os
 import time
 import uuid
+from datetime import datetime, timezone
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -31,7 +32,8 @@ _ALLOWED_METADATA = {
     "sparse_candidate_count", "fused_candidate_count", "reranker_status",
     "model", "provider", "prompt_version", "token_usage_available",
     "guardrail_decision", "evaluation_decision", "voice_stage",
-    "document_identifier_hash", "job_id",
+    "document_identifier_hash", "job_id", "fallback_triggered",
+    "fallback_reason", "llm_duration_ms",
 }
 _SENSITIVE_FIELD_NAMES = {
     "api_key", "password", "authorization", "cookie", "token",
@@ -149,7 +151,8 @@ class TraceHandle:
         try:
             self.client.update_run(
                 self.run_id,
-                end_time=int(time.time() * 1000),
+                # langsmith 0.12.x expects a datetime and calls isoformat().
+                end_time=datetime.now(timezone.utc),
                 outputs={"status": status},
                 extra={"metadata": final_metadata},
             )
@@ -160,7 +163,7 @@ class TraceHandle:
                 _metrics["durations_ms"].append(duration)
                 _metrics["last_trace_timestamp"] = time.time()
         except Exception as exc:
-            logger.warning("LangSmith trace finalization unavailable: %s", type(exc).__name__)
+            logger.warning("LangSmith trace finalization unavailable: %s: %s", type(exc).__name__, exc)
 
     def child(self, operation: str, **kwargs) -> "TraceHandle":
         return start_trace(operation, parent_run_id=self.run_id, **kwargs)
@@ -188,6 +191,7 @@ def start_trace(
     reranker_status: str | None = None,
     model: str | None = None,
     provider: str | None = None,
+    duration_ms: float | None = None,
     prompt_version: str | None = None,
     token_usage_available: bool | None = None,
     guardrail_decision: str | None = None,
@@ -214,6 +218,7 @@ def start_trace(
         reranker_status=reranker_status,
         model=model,
         provider=provider,
+        duration_ms=duration_ms,
         prompt_version=prompt_version,
         token_usage_available=token_usage_available,
         guardrail_decision=guardrail_decision,
@@ -291,6 +296,24 @@ def create_connectivity_trace() -> bool:
     return True
 
 
+def record_provider_metadata(metadata) -> None:
+    """Record safe provider metadata without prompts, questions, or content."""
+    try:
+        handle = start_trace(
+            "llm.provider",
+            provider=metadata.provider,
+            model=metadata.model,
+            duration_ms=metadata.duration_ms,
+            token_usage_available=metadata.token_usage_available,
+        )
+        if metadata.fallback_triggered:
+            handle.metadata["fallback_triggered"] = True
+            handle.metadata["fallback_reason"] = metadata.fallback_reason
+        handle.finish()
+    except Exception as exc:
+        logger.warning("Provider metadata recording unavailable: %s", type(exc).__name__)
+
+
 def observability_metrics() -> dict:
     with _metrics_lock:
         durations = sorted(_metrics["durations_ms"])
@@ -315,6 +338,40 @@ def _percentile(values: list[float], percentile: float) -> float | None:
         return None
     index = min(len(values) - 1, max(0, round((len(values) - 1) * percentile)))
     return round(values[index], 3)
+
+
+def recent_traces(limit: int = 20) -> dict:
+    """Retrieve real LangSmith runs without exposing prompts or secrets."""
+    client = _client()
+    if client is None:
+        return {"available": False, "traces": [], "reason": "LangSmith client is unavailable or tracing is not configured."}
+    try:
+        runs = client.list_runs(
+            project_name=os.environ["LANGSMITH_PROJECT"].strip(),
+            is_root=True,
+            limit=max(1, min(int(limit), 50)),
+        )
+        traces = []
+        for run in runs:
+            start = getattr(run, "start_time", None)
+            end = getattr(run, "end_time", None)
+            extra = getattr(run, "extra", None) or {}
+            metadata = extra.get("metadata", {}) if isinstance(extra, dict) else {}
+            traces.append({
+                "id": str(getattr(run, "id", "")),
+                "name": getattr(run, "name", None),
+                "run_type": getattr(run, "run_type", None),
+                "start_time": start.isoformat() if hasattr(start, "isoformat") else start,
+                "end_time": end.isoformat() if hasattr(end, "isoformat") else end,
+                "error": getattr(run, "error", None),
+                "latency_ms": round((end - start).total_seconds() * 1000, 3) if start and end else None,
+                "url": getattr(run, "url", None),
+                "metadata": {key: value for key, value in metadata.items() if key in _ALLOWED_METADATA},
+            })
+        return {"available": True, "traces": traces, "reason": None}
+    except Exception as exc:
+        logger.warning("LangSmith trace retrieval unavailable: %s: %s", type(exc).__name__, exc)
+        return {"available": False, "traces": [], "reason": f"Trace retrieval unavailable: {type(exc).__name__}."}
 
 
 def instrumentation_coverage() -> dict:

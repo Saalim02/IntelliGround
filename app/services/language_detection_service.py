@@ -106,7 +106,15 @@ def detect_voice_response_language(
     previous_language: str | None = None,
     provider_language: str | None = None,
 ) -> str:
-    """Choose the authoritative spoken response language for a voice turn.
+    return detect_voice_language(text, previous_language, provider_language)["language"]
+
+
+def detect_voice_language(
+    text: str,
+    previous_language: str | None = None,
+    provider_language: str | None = None,
+) -> dict:
+    """Choose the authoritative language for one voice turn.
 
     Dominant script drives switching. Short isolated Latin technical terms,
     numbers, and low-confidence mixed transcripts retain the previous voice
@@ -117,25 +125,25 @@ def detect_voice_response_language(
         previous = "en"
     provider = _normalize_provider_language(provider_language)
     if provider in VOICE_RESPONSE_LANGUAGES:
-        return provider
+        return {"language": provider, "confidence": 1.0, "source": "prisma"}
     info = detect_text_language(text)
     detected = info["language"]
     counts = info.get("script_counts", {})
     total = sum(counts.values())
     if not total:
-        return previous
+        return {"language": previous, "confidence": 0.0, "source": "fallback"}
     ranked = sorted(counts.items(), key=lambda item: item[1], reverse=True)
     dominant, dominant_count = ranked[0]
     dominant_ratio = dominant_count / total
     if detected == previous:
-        return previous
+        return {"language": previous, "confidence": round(dominant_ratio, 3), "source": "transcript"}
     if dominant not in VOICE_RESPONSE_LANGUAGES:
-        return previous
+        return {"language": previous, "confidence": round(dominant_ratio, 3), "source": "fallback"}
     # A short isolated Latin technical term such as "API" does not constitute
     # a genuine switch.  A short utterance in a distinct Indic script can be
     # authoritative when Prisma did not provide metadata.
     if dominant == "en" and sum(char.isalpha() for char in text) < 12:
-        return previous
+        return {"language": previous, "confidence": round(dominant_ratio, 3), "source": "fallback"}
     if dominant_ratio < 0.60:
-        return previous
-    return dominant
+        return {"language": previous, "confidence": round(dominant_ratio, 3), "source": "fallback"}
+    return {"language": dominant, "confidence": round(dominant_ratio, 3), "source": "transcript"}

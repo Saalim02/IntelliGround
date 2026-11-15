@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import time
+import logging
 from concurrent.futures import ThreadPoolExecutor
 
 from app.services.bm25_service import document_identity
@@ -20,6 +21,25 @@ RRF_CONSTANT = int(os.getenv("RRF_CONSTANT", "60"))
 RRF_CANDIDATE_LIMIT = int(os.getenv("RRF_CANDIDATE_LIMIT", "30"))
 RERANKER_CANDIDATE_LIMIT = int(os.getenv("RERANKER_CANDIDATE_LIMIT", "20"))
 FINAL_EVIDENCE_COUNT = int(os.getenv("FINAL_EVIDENCE_COUNT", "6"))
+
+logger = logging.getLogger(__name__)
+
+
+def _load_document_vectorstore(user_id: int, document_id: str):
+    try:
+        store = load_vectorstore(user_id, document_id=document_id)
+    except TypeError:
+        # Compatibility for older injected test/adaptor loaders.
+        return load_vectorstore(user_id)
+    return store
+
+
+def _load_document_sparse_store(user_id: int, document_id: str):
+    try:
+        store = load_sparse_vectorstore(user_id, document_id=document_id)
+    except TypeError:
+        return load_sparse_vectorstore(user_id)
+    return store
 
 
 def get_dynamic_top_k(total_chunks: int) -> int:
@@ -88,69 +108,120 @@ def _empty(active_filename, message, *, timings=None):
             "reranker_status": "not_run"}
 
 
-def retrieve_relevant_chunks(query: str, user_id: int | None = None):
+def _log_retrieval_stage(stage: str, results: list[dict], *, query: str, limit: int = 10) -> None:
+    """Record enough ranked evidence to diagnose multilingual retrieval loss."""
+    logger.info(
+        "qa retrieval trace stage=%s query=%r result_count=%d top=%s",
+        stage,
+        query[:240],
+        len(results),
+        [
+            {
+                "rank": rank,
+                "chunk_id": item.get("metadata", {}).get("chunk_id"),
+                "page": item.get("metadata", {}).get("page_number"),
+                "score": item.get("distance", item.get("dense_score", item.get("rrf_score", item.get("reranker_score")))),
+                "text": str(item.get("text", ""))[:240],
+            }
+            for rank, item in enumerate(results[:limit], start=1)
+        ],
+    )
+
+
+def retrieve_relevant_chunks(
+    query: str,
+    user_id: int | None = None,
+    query_variants: list[str] | None = None,
+):
     active_doc = get_active_document(user_id)
     if not active_doc:
         return _empty(None, "No active PDF uploaded.")
     active_filename = active_doc["active_filename"]
-    with vectorstore_read_lock(user_id):
+    with vectorstore_read_lock(user_id, active_doc["active_doc_id"]):
         with measure("qa.dense_index_load"):
-            dense_store = load_vectorstore(user_id)
+            dense_store = _load_document_vectorstore(user_id, active_doc["active_doc_id"])
         if dense_store is None:
             return _empty(active_filename, "Vector store is empty.")
 
         total_chunks = len(dense_store.docstore._dict)
         legacy_top_k = get_dynamic_top_k(total_chunks)
         with measure("qa.bm25_index_load"):
-            sparse_store = load_sparse_vectorstore(user_id)
+            sparse_store = _load_document_sparse_store(user_id, active_doc["active_doc_id"])
     timings = {}
     dense_k = DENSE_CANDIDATE_COUNT if sparse_store else legacy_top_k
+    queries = [query]
+    for variant in query_variants or []:
+        if variant and variant not in queries:
+            queries.append(variant)
+
     if sparse_store is not None:
         stage_times = {}
 
-        def dense_search():
+        def dense_search(search_query):
             started = time.perf_counter()
             with measure("qa.dense_retrieval"):
                 if hasattr(dense_store, "similarity_search_with_score_by_vector"):
                     result = dense_store.similarity_search_with_score_by_vector(
-                        list(embed_query_cached(query)), dense_k,
+                        list(embed_query_cached(search_query)), dense_k,
                     )
                 else:
-                    result = dense_store.similarity_search_with_score(query, dense_k)
+                    result = dense_store.similarity_search_with_score(search_query, dense_k)
             stage_times["dense_ms"] = round((time.perf_counter() - started) * 1000, 3)
-            return result
+            return [
+                (document, score, search_query)
+                for document, score in result
+            ]
 
-        def sparse_search():
+        def sparse_search(search_query):
             started = time.perf_counter()
             with measure("qa.bm25_retrieval"):
-                result = sparse_store.search(query, SPARSE_CANDIDATE_COUNT)
+                result = sparse_store.search(search_query, SPARSE_CANDIDATE_COUNT)
             stage_times["sparse_ms"] = round((time.perf_counter() - started) * 1000, 3)
-            return result
+            return [
+                {**item, "_retrieval_query": search_query}
+                for item in result
+            ]
 
-        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="hybrid-retrieval") as pool:
-            dense_future = pool.submit(dense_search)
-            sparse_future = pool.submit(sparse_search)
-            dense_pairs = dense_future.result()
-            sparse_raw = sparse_future.result()
+        with ThreadPoolExecutor(max_workers=max(2, len(queries) * 2), thread_name_prefix="hybrid-retrieval") as pool:
+            dense_futures = [pool.submit(dense_search, search_query) for search_query in queries]
+            sparse_futures = [pool.submit(sparse_search, search_query) for search_query in queries]
+            dense_pairs = [pair for future in dense_futures for pair in future.result()]
+            sparse_raw = [item for future in sparse_futures for item in future.result()]
     else:
         started = time.perf_counter()
         with measure("qa.dense_retrieval"):
-            if hasattr(dense_store, "similarity_search_with_score_by_vector"):
-                dense_pairs = dense_store.similarity_search_with_score_by_vector(
-                    list(embed_query_cached(query)), k=dense_k,
-                )
-            else:
-                dense_pairs = dense_store.similarity_search_with_score(query, k=dense_k)
+            dense_pairs = []
+            for search_query in queries:
+                if hasattr(dense_store, "similarity_search_with_score_by_vector"):
+                    dense_pairs.extend(
+                        (document, score, search_query)
+                        for document, score in dense_store.similarity_search_with_score_by_vector(
+                            list(embed_query_cached(search_query)), k=dense_k,
+                        )
+                    )
+                else:
+                    dense_pairs.extend(
+                        (document, score, search_query)
+                        for document, score in dense_store.similarity_search_with_score(search_query, k=dense_k)
+                    )
         dense_duration_ms = round((time.perf_counter() - started) * 1000, 3)
         sparse_raw = []
         stage_times = {"dense_ms": dense_duration_ms}
     timings.update(stage_times)
     timings.setdefault("sparse_ms", 0.0)
-    dense_results = []
-    for document, distance in dense_pairs:
+    dense_by_identity = {}
+    for document, distance, search_query in dense_pairs:
         result = _as_result(document, distance, distance=True)
+        result["_retrieval_query"] = search_query
         if _active(result, active_doc):
-            dense_results.append(result)
+            dense_by_identity.setdefault(result["identity"], result)
+    dense_results = list(dense_by_identity.values())
+    for search_query in queries:
+        _log_retrieval_stage(
+            "dense", [result for result in dense_results if result.get("_retrieval_query") == search_query],
+            query=search_query,
+        )
+    _log_retrieval_stage("dense_merged", dense_results, query=" | ".join(queries))
 
     if sparse_store is None:
         if not dense_results:
@@ -166,14 +237,28 @@ def retrieve_relevant_chunks(query: str, user_id: int | None = None):
                 "reranker_enabled": False, "reranker_status": "not_run"}
 
     sparse_results = [item for item in sparse_raw if _active(item, active_doc)]
+    for search_query in queries:
+        _log_retrieval_stage(
+            "sparse", [item for item in sparse_results if item.get("_retrieval_query") == search_query],
+            query=search_query,
+        )
+    _log_retrieval_stage("sparse_merged", sparse_results, query=" | ".join(queries))
     start = time.perf_counter()
     with measure("qa.rrf_fusion"):
         fused = reciprocal_rank_fusion(dense_results, sparse_results, k=RRF_CONSTANT, candidate_limit=RRF_CANDIDATE_LIMIT)
+    _log_retrieval_stage("rrf", fused, query=" | ".join(queries))
     timings["rrf_ms"] = round((time.perf_counter() - start) * 1000, 3)
     reranker = get_reranker()
     start = time.perf_counter()
     with measure("qa.reranking"):
-        reranked, reranker_status = reranker.rerank(query, fused[:RERANKER_CANDIDATE_LIMIT], FINAL_EVIDENCE_COUNT)
+        rerank_queries = [query, *(query_variants or [])]
+        if len({item for item in rerank_queries if item}) > 1 and hasattr(reranker, "rerank_queries"):
+            reranked, reranker_status = reranker.rerank_queries(
+                rerank_queries, fused[:RERANKER_CANDIDATE_LIMIT], FINAL_EVIDENCE_COUNT,
+            )
+        else:
+            reranked, reranker_status = reranker.rerank(query, fused[:RERANKER_CANDIDATE_LIMIT], FINAL_EVIDENCE_COUNT)
+    _log_retrieval_stage("reranked", reranked, query=" | ".join(query_variants or [query]))
     timings["reranker_ms"] = round((time.perf_counter() - start) * 1000, 3)
     if not reranked:
         return _empty(active_filename, "Answer not found in uploaded PDF.", timings=timings)

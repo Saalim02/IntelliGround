@@ -10,7 +10,9 @@ configure_application_logging()
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi import Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+import logging
 
 from app.services.security.rate_limiter import RateLimiter
 
@@ -46,6 +48,7 @@ from app.api.routes.document_intelligence import (
 )
 from app.api.routes.voice import router as voice_router
 from app.api.routes.developer import router as developer_router
+from app.api.routes.conversations import router as conversations_router
 
 from app.core.config import (
     FRONTEND_URL,
@@ -66,6 +69,25 @@ init_db()
 # FASTAPI APP
 # -----------------------------------
 app = FastAPI()
+logger = logging.getLogger(__name__)
+
+
+@app.exception_handler(RequestValidationError)
+async def request_validation_exception_handler(request: Request, exc: RequestValidationError):
+    errors = []
+    for error in exc.errors():
+        location = ".".join(str(item) for item in error.get("loc", []))
+        message = str(error.get("msg", "Invalid request."))
+        errors.append({"loc": error.get("loc", []), "msg": message, "type": error.get("type", "value_error")})
+        logger.warning(
+            "request validation failed: endpoint=%s document_id=%s response_language=%s validation_location=%s validation_message=%s",
+            request.url.path,
+            "redacted",
+            "redacted",
+            location,
+            message,
+        )
+    return JSONResponse(status_code=422, content={"detail": errors})
 
 # -----------------------------------
 # RATE LIMITING
@@ -223,5 +245,9 @@ app.include_router(
 )
 app.include_router(
     developer_router,
+    prefix="/api",
+)
+app.include_router(
+    conversations_router,
     prefix="/api",
 )

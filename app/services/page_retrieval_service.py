@@ -14,6 +14,7 @@ from app.services.document_registry_service import get_active_document
 from app.services.pdf_service import extract_text_from_pdf
 from app.services.bm25_service import load_sparse_index
 from app.services.user_storage_service import get_user_debug_dir, get_user_vectorstore_dir
+from app.services.vector_store_service import _resolve_vectorstore_dir
 
 
 class PageRetrievalError(ValueError):
@@ -51,7 +52,7 @@ def _chunk_from_record(record: Any, active: dict[str, Any]) -> dict[str, Any]:
 
 
 def _record_chunks(user_id: int, active: dict[str, Any]) -> list[dict[str, Any]]:
-    index = load_sparse_index(get_user_vectorstore_dir(user_id))
+    index = load_sparse_index(_resolve_vectorstore_dir(user_id, active.get("active_doc_id")))
     if index is None:
         return []
 
@@ -71,7 +72,9 @@ def _record_chunks(user_id: int, active: dict[str, Any]) -> list[dict[str, Any]]
 
 def _debug_page_text(user_id: int, active: dict[str, Any], page_number: int) -> str | None:
     """Load already-extracted page text exported during ingestion."""
-    document_dir = get_user_debug_dir(user_id) / Path(active["active_filename"]).stem
+    document_dir = get_user_debug_dir(user_id) / active["active_doc_id"]
+    if not document_dir.is_dir():
+        document_dir = get_user_debug_dir(user_id) / Path(active["active_filename"]).stem
     page_path = document_dir / "clean_pages" / f"page_{page_number:03}.txt"
     if not page_path.is_file():
         return None
@@ -91,7 +94,10 @@ def _authorized_pdf_path(user_id: int, pdf_path: str | Path, active: dict[str, A
     # The current registry stores the original filename but not the generated
     # upload path.  Refuse a path whose filename cannot be tied to that active
     # document rather than risking OCR from another user's active/old upload.
-    if candidate.name != Path(str(active["active_filename"])).name:
+    expected_path = active.get("source_path")
+    if expected_path and candidate != Path(expected_path).resolve():
+        raise PageRetrievalError("OCR source cannot be tied to the active document.")
+    if not expected_path and candidate.name != Path(str(active["active_filename"])).name:
         raise PageRetrievalError("OCR source cannot be tied to the active document.")
     return str(candidate)
 
@@ -181,7 +187,9 @@ def retrieve_pages(
         by_page.setdefault(int(record["page_number"]), []).append(record)
 
     known_pages = set(by_page)
-    document_dir = get_user_debug_dir(user_id) / Path(active["active_filename"]).stem
+    document_dir = get_user_debug_dir(user_id) / active["active_doc_id"]
+    if not document_dir.is_dir():
+        document_dir = get_user_debug_dir(user_id) / Path(active["active_filename"]).stem
     clean_pages_dir = document_dir / "clean_pages"
     if clean_pages_dir.is_dir():
         known_pages.update(

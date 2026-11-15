@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from typing import List, Optional
+from typing import List, Optional, Literal
 
 from app.models.evaluation_models import (
     EvaluationDecision,
@@ -14,6 +14,9 @@ class QueryRequest(BaseModel):
     user_openai_api_key: Optional[str] = ""
     query_language: Optional[str] = None
     response_language: Optional[str] = None
+    response_length: Literal["short", "medium", "large"] = "medium"
+    retrieval_strategy: Optional[str] = None
+    retrieval_query_language: Optional[str] = None
     conversation_id: Optional[str] = None
     conversation_context: Optional[str] = None
     turn_id: Optional[str] = None
@@ -21,6 +24,11 @@ class QueryRequest(BaseModel):
     # queries and keeps deterministic test/adaptor callers backwards
     # compatible while enabling semantic routing on the live voice path.
     use_semantic_intent: bool = False
+    suggestion_provenance: Optional[dict] = None
+    detected_emotion: Optional[str] = None
+    emotion_confidence: Optional[float] = None
+    response_tone: Optional[str] = None
+    selected_emotion: Optional[str] = None
 
 
 class RetrievedChunk(BaseModel):
@@ -88,4 +96,11 @@ class QueryResponse(BaseModel):
     reranker_status: Optional[str] = None
     message: str
     conversation_id: Optional[str] = None
+    document_language: Optional[str] = None
+    query_language: Optional[str] = None
+    retrieval_language: Optional[str] = None
+    response_language: Optional[str] = None
     answer_id: Optional[int] = None
+    detected_emotion: Optional[str] = None
+    emotion_confidence: Optional[float] = None
+    response_tone: Optional[str] = None

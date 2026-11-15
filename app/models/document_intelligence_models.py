@@ -1,17 +1,26 @@
 from typing import Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+from app.services.language_registry import validate_language
 
 
-ResponseLanguage = Literal[
-    "kn", "en", "hi", "ta", "te", "ml", "mr", "gu", "bn", "pa", "ur"
-]
+ResponseLanguage = str
 
 
 class DocumentLanguageRequest(BaseModel):
     response_language: ResponseLanguage
+    response_length: Literal["short", "medium", "large"] = "medium"
+    conversation_id: Optional[str] = None
+    document_id: Optional[str] = None
+    document_language: Optional[str] = None
     access_password: Optional[str] = ""
     user_openai_api_key: Optional[str] = ""
+
+    @field_validator("response_language")
+    @classmethod
+    def validate_response_language(cls, value: str) -> str:
+        return validate_language(value)
 
 
 class EvidenceReference(BaseModel):
@@ -37,12 +46,19 @@ class GeneratedDocumentQuestion(BaseModel):
     difficulty: str
     suggested_answer: Optional[str] = None
     evidence: list[EvidenceReference] = Field(default_factory=list)
+    document_id: Optional[str] = None
+    document_language: Optional[str] = None
+    supporting_chunk_ids: list[int] = Field(default_factory=list)
+    supporting_pages: list[int] = Field(default_factory=list)
+    answerability: str = "validated"
 
 
 class DocumentSummaryResponse(BaseModel):
     status: str
+    conversation_id: Optional[str] = None
     active_document: Optional[str] = None
     response_language: str
+    response_length: Literal["short", "medium", "large"] = "medium"
     short_summary: str = ""
     detailed_summary: str = ""
     evidence: list[EvidenceReference] = Field(default_factory=list)
@@ -54,8 +70,10 @@ class DocumentSummaryResponse(BaseModel):
 
 class DocumentTopicsResponse(BaseModel):
     status: str
+    conversation_id: Optional[str] = None
     active_document: Optional[str] = None
     response_language: str
+    response_length: Literal["short", "medium", "large"] = "medium"
     topics: list[DocumentTopic] = Field(default_factory=list)
     unsupported_items: list[str] = Field(default_factory=list)
     message: str
@@ -63,11 +81,14 @@ class DocumentTopicsResponse(BaseModel):
 
 class DocumentQuestionsResponse(BaseModel):
     status: str
+    conversation_id: Optional[str] = None
     active_document: Optional[str] = None
     response_language: str
+    response_length: Literal["short", "medium", "large"] = "medium"
     questions: list[GeneratedDocumentQuestion] = Field(default_factory=list)
     unsupported_items: list[str] = Field(default_factory=list)
     message: str
+    validation_diagnostics: dict[str, int] = Field(default_factory=dict)
 
 
 class DocumentLanguageResponse(BaseModel):

@@ -7,6 +7,7 @@ from fastapi.testclient import TestClient
 from app.services import document_intelligence_service as intelligence
 from app.services import document_registry_service
 from app.services.language_registry import is_language_supported_text
+from app.services.llm.base import LLMProviderError
 from app.main import app
 from app.models.auth_models import User
 from app.services.security.auth_dependencies import get_current_user
@@ -181,6 +182,30 @@ def test_summary_retries_once_after_wrong_language_payload(monkeypatch):
     assert result["short_summary"] == right["short_summary"]
 
 
+def test_summary_keeps_valid_selected_language_prose_when_optional_items_fail_language_validation(monkeypatch):
+    _configure(monkeypatch, "hi", {
+        "short_summary": "यह दस्तावेज़ महत्वपूर्ण जानकारी बताता है।",
+        "detailed_summary": "यह दस्तावेज़ सार्वजनिक सेवाओं की जानकारी समझाता है।",
+        "main_conclusions": [{
+            "text": "This optional conclusion is not Hindi.",
+            "evidence": [{"chunk_id": 7}],
+        }],
+        "topics": [{
+            "title": "Optional English topic",
+            "explanation": "This item will be filtered without discarding the summary.",
+            "evidence": [{"chunk_id": 7}],
+        }],
+        "unsupported_items": [],
+    })
+
+    result = intelligence.generate_document_summary(11, "test-key", response_language="hi")
+
+    assert result["response_language"] == "hi"
+    assert result["short_summary"].startswith("यह")
+    assert result["topics"] == []
+    assert result["main_conclusions"] == []
+
+
 def test_explicit_urdu_request_overrides_persisted_english(monkeypatch):
     urdu = "یہ دستاویز عوامی خدمات کے بارے میں مختصر خلاصہ پیش کرتی ہے۔"
     payload = {
@@ -220,6 +245,184 @@ def test_questions_use_explicit_response_language(monkeypatch):
 
     assert captured["language"] == "ur"
     assert result["response_language"] == "ur"
+
+
+def test_questions_reject_model_marked_unanswerable_and_return_provenance(monkeypatch):
+    chunks = [_chunk(doc_id="ml-doc", chunk_id=17, page=6)]
+    monkeypatch.setattr(
+        intelligence,
+        "_base",
+        lambda _user_id, _api_key, response_language: (
+            {"active_doc_id": "ml-doc", "active_filename": "source.pdf", "evidence_language": "ml"},
+            chunks,
+            response_language,
+        ),
+    )
+    monkeypatch.setattr(
+        intelligence,
+        "_invoke",
+        lambda *_args, **_kwargs: {
+            "questions": [
+                {"question": "What does the document explain?", "answerable": True, "evidence": [{"chunk_id": 17}]},
+                {"question": "What is the weather tomorrow?", "answerable": False, "evidence": [{"chunk_id": 17}]},
+            ],
+            "unsupported_items": [],
+        },
+    )
+
+    result = intelligence.generate_document_questions(11, "test-key", response_language="en")
+
+    assert [item["question"] for item in result["questions"]] == ["What does the document explain?"]
+    item = result["questions"][0]
+    assert item["document_id"] == "ml-doc"
+    assert item["document_language"] == "ml"
+    assert item["supporting_chunk_ids"] == [17]
+    assert item["supporting_pages"] == [6]
+    assert item["answerability"] == "validated"
+
+
+def test_telugu_source_bengali_questions_survive_noncompliant_optional_answer(monkeypatch):
+    chunks = [_chunk(doc_id="te-doc", chunk_id=91, page=4)]
+    monkeypatch.setattr(
+        intelligence,
+        "_base",
+        lambda _user_id, _api_key, response_language: (
+            {"active_doc_id": "te-doc", "active_filename": "telugu.pdf", "evidence_language": "te"},
+            chunks,
+            response_language,
+        ),
+    )
+    monkeypatch.setattr(
+        intelligence,
+        "_invoke",
+        lambda *_args, **_kwargs: {
+            "questions": [{
+                "question": "এই নথিতে কোন বিষয়টি ব্যাখ্যা করা হয়েছে?",
+                "suggested_answer": "The answer is present in the Telugu source passage.",
+                "question_type": "factual",
+                "difficulty": "easy",
+                "evidence": [{"chunk_id": 91}],
+            }],
+            "unsupported_items": [],
+        },
+    )
+
+    result = intelligence.generate_document_questions(11, "test-key", response_language="bn", response_length="medium")
+
+    assert result["response_language"] == "bn"
+    assert result["questions"][0]["question"].startswith("এই নথিতে")
+    assert result["questions"][0]["suggested_answer"] is None
+    assert result["questions"][0]["document_language"] == "te"
+    assert result["questions"][0]["supporting_chunk_ids"] == [91]
+    assert result["questions"][0]["supporting_pages"] == [4]
+
+
+@pytest.mark.parametrize(
+    ("source_language", "response_language", "question"),
+    [
+        ("te", "ta", "இந்த ஆவணத்தில் எந்த தலைப்பு விளக்கப்பட்டுள்ளது?"),
+        ("te", "bn", "এই নথিতে কোন বিষয়টি ব্যাখ্যা করা হয়েছে?"),
+        ("kn", "en", "What topic does this document explain?"),
+        ("en", "kn", "ಈ ದಾಖಲೆ ಯಾವ ವಿಷಯವನ್ನು ವಿವರಿಸುತ್ತದೆ?"),
+        ("ml", "hi", "यह दस्तावेज़ किस विषय की व्याख्या करता है?"),
+        ("ta", "te", "ఈ పత్రం ఏ అంశాన్ని వివరిస్తుంది?"),
+    ],
+)
+def test_questions_follow_selected_language_independently_of_source(
+    monkeypatch, source_language, response_language, question,
+):
+    chunks = [_chunk(doc_id=f"{source_language}-doc", chunk_id=91, page=4)]
+    monkeypatch.setattr(
+        intelligence,
+        "_base",
+        lambda _user_id, _api_key, language: (
+            {
+                "active_doc_id": f"{source_language}-doc",
+                "active_filename": "source.pdf",
+                "evidence_language": source_language,
+            },
+            chunks,
+            language,
+        ),
+    )
+    monkeypatch.setattr(
+        intelligence,
+        "_invoke",
+        lambda _api_key, language, _chunks, _task, operation="document_intelligence": {
+            "questions": [{
+                "question": question,
+                "question_type": "factual",
+                "difficulty": "easy",
+                "suggested_answer": None,
+                "evidence": [{"chunk_id": 91}],
+            }],
+            "unsupported_items": [],
+        },
+    )
+
+    result = intelligence.generate_document_questions(
+        11, "test-key", response_language=response_language,
+    )
+
+    assert result["response_language"] == response_language
+    assert result["questions"][0]["response_language"] == response_language
+    assert result["questions"][0]["document_language"] == source_language
+
+
+def test_questions_retry_when_model_returns_source_language_for_selected_tamil(monkeypatch):
+    calls = []
+    chunks = [_chunk(doc_id="te-doc", chunk_id=91, page=4)]
+    monkeypatch.setattr(
+        intelligence,
+        "_base",
+        lambda *_args, **_kwargs: (
+            {"active_doc_id": "te-doc", "active_filename": "telugu.pdf", "evidence_language": "te"},
+            chunks,
+            "ta",
+        ),
+    )
+    wrong = {
+        "questions": [{"question": "ఈ పత్రం ఏ అంశాన్ని వివరిస్తుంది?", "evidence": [{"chunk_id": 91}]}],
+        "unsupported_items": [],
+    }
+    right = {
+        "questions": [{"question": "இந்த ஆவணம் எந்த தலைப்பை விளக்குகிறது?", "evidence": [{"chunk_id": 91}]}],
+        "unsupported_items": [],
+    }
+    monkeypatch.setattr(
+        intelligence,
+        "_invoke",
+        lambda *_args, **_kwargs: calls.append(True) or (wrong if len(calls) == 1 else right),
+    )
+
+    result = intelligence.generate_document_questions(11, "test-key", response_language="ta")
+
+    assert len(calls) == 2
+    assert result["questions"][0]["question"].startswith("இந்த ஆவணம்")
+
+
+def test_telugu_source_terms_do_not_reject_english_summary(monkeypatch):
+    english = "The document explains the programme announced in తెలుగు and identifies key public initiatives."
+    monkeypatch.setattr(
+        intelligence,
+        "_base",
+        lambda *_args: (
+            {"active_doc_id": "te-doc", "active_filename": "telugu.pdf", "evidence_language": "te"},
+            [_chunk(doc_id="te-doc", chunk_id=3)],
+            "en",
+        ),
+    )
+    monkeypatch.setattr(
+        intelligence,
+        "_invoke",
+        lambda *_args, **_kwargs: {
+            "short_summary": english,
+            "detailed_summary": english,
+            "main_conclusions": [], "topics": [], "unsupported_items": [],
+        },
+    )
+    result = intelligence.generate_document_summary(11, "test-key", response_language="en")
+    assert result["short_summary"] == english
 
 
 def test_invalid_language_is_rejected_by_api_model():
@@ -491,6 +694,163 @@ def test_language_and_summary_endpoints_are_authenticated_and_contractual(monkey
         assert summary_response.json()["response_language"] == "ur"
     finally:
         app.dependency_overrides.pop(get_current_user, None)
+
+
+def test_active_document_questions_endpoint_forwards_selected_language(monkeypatch):
+    user = User(id=42, email="questions@example.com", is_active=True)
+    app.dependency_overrides[get_current_user] = lambda: user
+    captured = {}
+    try:
+        monkeypatch.setattr(
+            "app.api.routes.document_intelligence.get_active_document",
+            lambda _user_id: {
+                "active_doc_id": "telugu-doc",
+                "active_filename": "telugu.pdf",
+                "evidence_language": "te",
+            },
+        )
+        monkeypatch.setattr(
+            "app.api.routes.document_intelligence.resolve_authorized_api_key",
+            lambda **_kwargs: "test-key",
+        )
+
+        def generate_questions(_user_id, _api_key, response_language=None, response_length="medium"):
+            captured.update(response_language=response_language, response_length=response_length)
+            return {
+                "status": "success",
+                "active_document": "telugu.pdf",
+                "response_language": response_language,
+                "questions": [{
+                    "question": "இந்த ஆவணம் எந்த தலைப்பை விளக்குகிறது?",
+                    "question_type": "factual",
+                    "difficulty": "easy",
+                    "evidence": [],
+                    "response_language": response_language,
+                }],
+                "unsupported_items": [],
+                "message": "ok",
+            }
+
+        monkeypatch.setattr(
+            "app.api.routes.document_intelligence.generate_document_questions",
+            generate_questions,
+        )
+        response = TestClient(app).post(
+            "/api/document/questions",
+            json={"response_language": "ta", "document_language": "te"},
+        )
+        assert response.status_code == 200
+        assert captured == {"response_language": "ta", "response_length": "medium"}
+        assert response.json()["response_language"] == "ta"
+    finally:
+        app.dependency_overrides.pop(get_current_user, None)
+
+
+@pytest.mark.parametrize("endpoint", ["summary", "topics", "questions"])
+@pytest.mark.parametrize("language", ["en", "kn", "te", "ta", "hi", "ml", "bn", "pa", "gu", "mr"])
+def test_all_document_intelligence_endpoints_accept_supported_languages(monkeypatch, endpoint, language):
+    user = User(id=42, email="matrix@example.com", is_active=True)
+    app.dependency_overrides[get_current_user] = lambda: user
+    try:
+        monkeypatch.setattr(
+            "app.api.routes.document_intelligence.get_active_document",
+            lambda _user_id: {
+                "active_doc_id": "source-doc",
+                "active_filename": "source.pdf",
+                "evidence_language": "ta",
+            },
+        )
+        monkeypatch.setattr(
+            "app.api.routes.document_intelligence.resolve_authorized_api_key",
+            lambda **_kwargs: "test-key",
+        )
+        evidence = [{"page_number": 1, "chunk_id": 1, "text": "Original source evidence."}]
+        summary = {
+            "status": "success", "active_document": "source.pdf", "response_language": language,
+            "short_summary": "Generated summary", "detailed_summary": "Generated detail",
+            "evidence": evidence, "main_conclusions": [], "topics": [],
+            "unsupported_items": [], "message": "ok",
+        }
+        topic = {
+            "status": "success", "active_document": "source.pdf", "response_language": language,
+            "topics": [], "unsupported_items": [], "message": "ok",
+        }
+        question = {
+            "status": "success", "active_document": "source.pdf", "response_language": language,
+            "questions": [], "unsupported_items": [], "message": "ok",
+        }
+        monkeypatch.setattr("app.api.routes.document_intelligence.generate_document_summary", lambda *_args, **_kwargs: summary)
+        monkeypatch.setattr("app.api.routes.document_intelligence.generate_document_topics", lambda *_args, **_kwargs: topic)
+        monkeypatch.setattr("app.api.routes.document_intelligence.generate_document_questions", lambda *_args, **_kwargs: question)
+
+        response = TestClient(app).post(
+            f"/api/document/{endpoint}",
+            json={"document_id": "source-doc", "document_language": "ta", "response_language": language},
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["response_language"] == language
+    finally:
+        app.dependency_overrides.pop(get_current_user, None)
+
+
+def test_document_intelligence_validation_error_identifies_field(monkeypatch):
+    user = User(id=42, email="validation@example.com", is_active=True)
+    app.dependency_overrides[get_current_user] = lambda: user
+    try:
+        response = TestClient(app).post("/api/document/summary", json={"document_id": "source-doc"})
+        assert response.status_code == 422
+        assert response.json()["detail"][0]["loc"] == ["body", "response_language"]
+    finally:
+        app.dependency_overrides.pop(get_current_user, None)
+
+
+def test_document_intelligence_generation_failure_is_not_reported_as_request_422(monkeypatch):
+    user = User(id=42, email="generation-failure@example.com", is_active=True)
+    app.dependency_overrides[get_current_user] = lambda: user
+    try:
+        monkeypatch.setattr(
+            "app.api.routes.document_intelligence.resolve_authorized_api_key",
+            lambda **_kwargs: "test-key",
+        )
+        monkeypatch.setattr(
+            "app.api.routes.document_intelligence.generate_document_summary",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(ValueError("Generated summary failed language validation.")),
+        )
+        response = TestClient(app).post("/api/document/summary", json={"response_language": "ta"})
+        assert response.status_code == 503
+        assert response.json()["detail"]["endpoint"] == "/api/document/summary"
+        assert response.json()["detail"]["stage"] == "validation"
+        assert response.json()["detail"]["failure_category"] == "document_generation_error"
+    finally:
+        app.dependency_overrides.pop(get_current_user, None)
+
+
+def test_document_generation_provider_authentication_failure_is_classified(monkeypatch):
+    monkeypatch.setattr(
+        intelligence,
+        "get_llm",
+        lambda _api_key: (_ for _ in ()).throw(
+            LLMProviderError("OpenAI authentication failed.", category="provider_authentication_error")
+        ),
+    )
+    with pytest.raises(intelligence.DocumentIntelligenceGenerationError) as error:
+        intelligence._invoke("test-key", "en", [_chunk()], "Generate summary.", operation="test_generation")
+    assert error.value.category == "provider_authentication_error"
+    assert error.value.stage == "generation"
+    assert error.value.retry_attempted is False
+
+
+def test_document_generation_malformed_output_is_classified_as_parsing_failure(monkeypatch):
+    class Malformed:
+        def invoke(self, _input):
+            return SimpleNamespace(content="not JSON")
+
+    monkeypatch.setattr(intelligence, "get_llm", lambda _api_key: Malformed())
+    with pytest.raises(intelligence.DocumentIntelligenceGenerationError) as error:
+        intelligence._invoke("test-key", "en", [_chunk()], "Generate summary.", operation="test_generation")
+    assert error.value.category == "invalid_provider_response"
+    assert error.value.stage == "parsing"
+    assert error.value.retry_attempted is True
 
 
 def test_current_document_endpoint_returns_persisted_language_metadata(monkeypatch):

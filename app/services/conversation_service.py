@@ -26,14 +26,23 @@ def create_conversation(
     response_language: str,
     speech_input_language: str | None,
     speech_output_language: str | None,
+    response_length: str = "medium",
+    title: str | None = None,
 ) -> Conversation:
     conversation = Conversation(
         id=str(uuid.uuid4()),
         user_id=user.id,
         document_id=document["active_doc_id"],
         document_name=document["active_filename"],
+        document_path=document.get("source_path"),
+        document_sha256=document.get("sha256"),
+        document_input_language=document.get("input_language"),
+        document_evidence_language=document.get("evidence_language"),
+        document_total_pages=document.get("total_pages"),
+        title=title,
         mode=mode,
         response_language=response_language,
+        response_length=response_length,
         speech_input_language=speech_input_language,
         speech_output_language=speech_output_language,
     )
@@ -41,6 +50,21 @@ def create_conversation(
     db.commit()
     db.refresh(conversation)
     return conversation
+
+
+def validate_document_reupload(
+    conversation: Conversation,
+    *,
+    filename: str,
+    sha256: str | None,
+    confirmed_replacement: bool = False,
+) -> tuple[bool, str]:
+    """Validate a PDF before rebuilding a historical conversation's index."""
+    if conversation.document_name == filename and conversation.document_sha256 and conversation.document_sha256 == sha256:
+        return True, "verified"
+    if confirmed_replacement:
+        return True, "explicit replacement confirmed"
+    return False, "The PDF identity could not be verified. Confirm that this upload should replace the unavailable document."
 
 
 def get_owned_conversation(db: Session, user: User, conversation_id: str) -> Conversation:
@@ -202,11 +226,86 @@ def serialize_conversation(conversation: Conversation) -> dict:
         "id": conversation.id,
         "document_id": conversation.document_id,
         "document_name": conversation.document_name,
+        "document_path": conversation.document_path,
+        "document_sha256": conversation.document_sha256,
+        "title": conversation.title or conversation.document_name,
         "mode": conversation.mode,
         "response_language": conversation.response_language,
+        "response_length": conversation.response_length or "medium",
         "speech_input_language": conversation.speech_input_language,
         "speech_output_language": conversation.speech_output_language,
         "state": conversation.state,
         "created_at": conversation.created_at.isoformat(),
         "updated_at": conversation.updated_at.isoformat(),
     }
+
+
+def _json_load(value: str | None, fallback):
+    try:
+        parsed = json.loads(value or "")
+        return parsed if parsed is not None else fallback
+    except (TypeError, ValueError):
+        return fallback
+
+
+def serialize_conversation_detail(db: Session, conversation: Conversation) -> dict:
+    turns = (
+        db.query(ConversationTurn)
+        .filter(ConversationTurn.conversation_id == conversation.id, ConversationTurn.user_id == conversation.user_id)
+        .order_by(ConversationTurn.created_at.asc(), ConversationTurn.id.asc())
+        .all()
+    )
+    messages = []
+    for turn in turns:
+        text = turn.transcript if turn.role == "user" else turn.answer
+        if text:
+            messages.append({"role": turn.role, "text": text, "evidence": _json_load(turn.evidence_json, []), "answer_id": turn.id if turn.role == "assistant" else None, "time": turn.created_at.isoformat()})
+    return {
+        **serialize_conversation(conversation),
+        "messages": messages,
+        "intelligence": {
+            "summary": _json_load(conversation.summary_json, None),
+            "topics": _json_load(conversation.topics_json, None),
+            "questions": _json_load(conversation.questions_json, None),
+        },
+        "document": {
+            "active_doc_id": conversation.document_id,
+            "active_filename": conversation.document_name,
+            "source_path": conversation.document_path,
+            "sha256": conversation.document_sha256,
+            "input_language": conversation.document_input_language,
+            "evidence_language": conversation.document_evidence_language,
+            "total_pages": conversation.document_total_pages,
+            "response_language": conversation.response_language,
+        },
+    }
+
+
+def save_conversation_panel(db: Session, user: User, conversation_id: str, *, kind: str, result: dict, response_language: str, response_length: str, document_id: str | None = None) -> Conversation:
+    conversation = get_owned_conversation(db, user, conversation_id)
+    if document_id and conversation.document_id != document_id:
+        raise HTTPException(status_code=409, detail="Conversation is attached to a different document.")
+    conversation.response_language = response_language
+    conversation.response_length = response_length
+    field = {"summary": "summary_json", "topics": "topics_json", "questions": "questions_json"}.get(kind)
+    if field is None:
+        raise HTTPException(status_code=400, detail="Unknown intelligence panel.")
+    setattr(conversation, field, json.dumps(result, ensure_ascii=False))
+    db.add(conversation)
+    db.commit()
+    db.refresh(conversation)
+    return conversation
+
+
+def update_conversation_preferences(db: Session, user: User, conversation_id: str, *, title: str | None = None, response_language: str | None = None, response_length: str | None = None) -> Conversation:
+    conversation = get_owned_conversation(db, user, conversation_id)
+    if title is not None:
+        conversation.title = title[:512]
+    if response_language is not None:
+        conversation.response_language = response_language
+    if response_length is not None:
+        conversation.response_length = response_length
+    db.add(conversation)
+    db.commit()
+    db.refresh(conversation)
+    return conversation

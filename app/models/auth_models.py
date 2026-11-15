@@ -121,3 +121,23 @@ class PasswordResetToken(Base):
         nullable=False,
         default=lambda: datetime.now(timezone.utc),
     )
+
+
+class VoicePreference(Base):
+    """Per-user Timbre voice selection; absence means use provider default."""
+
+    __tablename__ = "voice_preferences"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id"), unique=True, index=True, nullable=False
+    )
+    voice_id: Mapped[str] = mapped_column(String(120), nullable=False)
+    language: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    response_emotion: Mapped[str | None] = mapped_column(String(24), nullable=True, default="AUTO")
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
